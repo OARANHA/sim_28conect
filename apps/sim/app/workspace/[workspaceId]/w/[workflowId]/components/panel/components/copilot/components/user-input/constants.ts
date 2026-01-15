@@ -41,6 +41,19 @@ export const MODEL_OPTIONS = [
 ] as const
 
 /**
+ * Provider configuration options
+ */
+export const PROVIDER_OPTIONS = [
+  { value: 'default', label: 'Default (from .env)', icon: '⚙️' },
+  { value: 'anthropic', label: 'Anthropic (Claude)', icon: '🤖' },
+  { value: 'openai', label: 'OpenAI (GPT)', icon: '🧠' },
+  { value: 'mistral', label: 'Mistral AI', icon: '⚡' },
+  { value: 'z-ai', label: 'Z.AI', icon: '🚀' },
+  { value: 'azure-openai', label: 'Azure OpenAI', icon: '☁️' },
+  { value: 'vertex', label: 'Vertex AI', icon: '🌐' },
+] as const
+
+/**
  * Threshold for considering input "near top" of viewport (in pixels)
  */
 export const NEAR_TOP_THRESHOLD = 300
