@@ -19,6 +19,7 @@ import {
 } from '@/app/chat/components'
 import { CHAT_ERROR_MESSAGES, CHAT_REQUEST_TIMEOUT_MS } from '@/app/chat/constants'
 import { useAudioStreaming, useChatStreaming } from '@/app/chat/hooks'
+import { useProviderSelectionStore } from '@/stores/providers'
 
 const logger = createLogger('ChatClient')
 
@@ -131,6 +132,9 @@ export default function ChatClient({ identifier }: { identifier: string }) {
     useChatStreaming()
   const audioContextRef = useRef<AudioContext | null>(null)
   const { isPlayingAudio, streamTextToAudio, stopAudio } = useAudioStreaming(audioContextRef)
+
+  // Get selected provider from store
+  const selectedProvider = useProviderSelectionStore((state) => state.selectedProvider)
 
   const scrollToBottom = useCallback(() => {
     if (messagesEndRef.current) {
@@ -298,6 +302,7 @@ export default function ChatClient({ identifier }: { identifier: string }) {
       isVoiceInput,
       conversationId,
       filesCount: files?.length,
+      selectedProvider,
     })
 
     setUserHasScrolled(false)
@@ -336,6 +341,11 @@ export default function ChatClient({ identifier }: { identifier: string }) {
             ? userMessage.content
             : JSON.stringify(userMessage.content),
         conversationId,
+      }
+
+      // Add provider selection if set
+      if (selectedProvider) {
+        payload.provider = selectedProvider
       }
 
       if (files && files.length > 0) {
