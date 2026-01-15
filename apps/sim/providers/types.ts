@@ -15,6 +15,8 @@ export type ProviderId =
   | 'openrouter'
   | 'vllm'
   | 'bedrock'
+  | 'openai-compatible'
+  | 'z-ai'
 
 export interface ModelPricing {
   input: number // Per 1M tokens

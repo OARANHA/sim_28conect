@@ -141,6 +141,11 @@ export interface Tool {
 // This type is only for the `provider` field in requests sent to the Sim Agent
 export type CopilotProviderConfig =
   | {
+      provider: 'sim'
+      model: string
+      apiKey?: string
+    }
+  | {
       provider: 'azure-openai'
       model: string
       apiKey?: string
@@ -155,7 +160,13 @@ export type CopilotProviderConfig =
       vertexLocation?: string
     }
   | {
-      provider: Exclude<ProviderId, 'azure-openai' | 'vertex'>
+      provider: 'openai-compatible'
+      model: string
+      apiKey?: string
+      baseUrl?: string
+    }
+  | {
+      provider: Exclude<ProviderId, 'sim' | 'azure-openai' | 'vertex' | 'openai-compatible'>
       model?: string
       apiKey?: string
     }

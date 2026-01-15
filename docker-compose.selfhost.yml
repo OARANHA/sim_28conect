@@ -1,0 +1,157 @@
+version: '3.9'
+
+x-build-args: &build-args
+  BUILDKIT_INLINE_CACHE: "1"
+
+services:
+  simstudio:
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile   # Dockerfile OFICIAL, com seu código já alterado
+      args: *build-args
+    image: simv4-simstudio:latest
+    container_name: simstudio-app
+    ports:
+      - '${APP_PORT:-3000}:3000'
+    environment:
+      # Node/Next
+      - NODE_ENV=production
+
+      # Core Database & Authentication
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-simstudio}
+      - BETTER_AUTH_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET}
+
+      # Copilot / AI Provider Configuration
+      - COPILOT_PROVIDER=${COPILOT_PROVIDER:-sim}
+      - COPILOT_MODEL=${COPILOT_MODEL}
+      - COPILOT_API_KEY=${COPILOT_API_KEY}
+      - COPILOT_BASE_URL=${COPILOT_BASE_URL}
+      - SIM_AGENT_API_URL=${SIM_AGENT_API_URL:-https://copilot.sim.ai}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
+
+      # Azure OpenAI (optional)
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION}
+
+      # Vertex AI (optional)
+      - VERTEX_PROJECT=${VERTEX_PROJECT}
+      - VERTEX_LOCATION=${VERTEX_LOCATION}
+
+      # Local AI Models (optional)
+      - OLLAMA_URL=${OLLAMA_URL}
+      - VLLM_BASE_URL=${VLLM_BASE_URL}
+      - VLLM_API_KEY=${VLLM_API_KEY}
+
+      # Real-time Communication
+      - NEXT_PUBLIC_SOCKET_URL=${NEXT_PUBLIC_SOCKET_URL:-http://localhost:3002}
+
+      # Email Provider (optional)
+      - RESEND_API_KEY=${RESEND_API_KEY}
+
+      # Admin API (optional)
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
+
+      # Other Services (optional)
+      - REDIS_URL=${REDIS_URL}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
+      realtime:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+          cpus: '6'
+    healthcheck:
+      test: ['CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3000']
+      interval: 90s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - sim-network
+
+  realtime:
+    image: ghcr.io/simstudioai/realtime:latest   # usa imagem OFICIAL
+    container_name: simstudio-realtime
+    ports:
+      - '${REALTIME_PORT:-3002}:3002'
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-simstudio}
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      - BETTER_AUTH_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
+      - SOCKET_PORT=${REALTIME_PORT:-3002}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    healthcheck:
+      test: ['CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3002/health']
+      interval: 90s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - sim-network
+
+  migrations:
+    image: ghcr.io/simstudioai/migrations:latest  # usa imagem OFICIAL
+    container_name: simstudio-migrations
+    working_dir: /app/packages/db
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-simstudio}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ['bun', 'run', 'db:migrate']
+    restart: 'no'
+    networks:
+      - sim-network
+
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: simstudio-postgres
+    restart: always
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-simstudio}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sim-network
+
+networks:
+  sim-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local

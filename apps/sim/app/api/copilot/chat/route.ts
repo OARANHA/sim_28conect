@@ -17,6 +17,7 @@ import {
 } from '@/lib/copilot/request-helpers'
 import { getCredentialsServerTool } from '@/lib/copilot/tools/server/user/get-credentials'
 import type { CopilotProviderConfig } from '@/lib/copilot/types'
+import { getProviderConfig } from '@/lib/copilot/providers'
 import { env } from '@/lib/core/config/env'
 import { CopilotFiles } from '@/lib/uploads'
 import { createFileContent } from '@/lib/uploads/utils/file-utils'
@@ -291,33 +292,16 @@ export async function POST(req: NextRequest) {
     const defaults = getCopilotModel('chat')
     const modelToUse = env.COPILOT_MODEL || defaults.model
 
-    let providerConfig: CopilotProviderConfig | undefined
-    const providerEnv = env.COPILOT_PROVIDER as any
+    // Get provider configuration using factory function
+    const providerConfig = getProviderConfig()
 
-    if (providerEnv) {
-      if (providerEnv === 'azure-openai') {
-        providerConfig = {
-          provider: 'azure-openai',
-          model: modelToUse,
-          apiKey: env.AZURE_OPENAI_API_KEY,
-          apiVersion: 'preview',
-          endpoint: env.AZURE_OPENAI_ENDPOINT,
-        }
-      } else if (providerEnv === 'vertex') {
-        providerConfig = {
-          provider: 'vertex',
-          model: modelToUse,
-          apiKey: env.COPILOT_API_KEY,
-          vertexProject: env.VERTEX_PROJECT,
-          vertexLocation: env.VERTEX_LOCATION,
-        }
-      } else {
-        providerConfig = {
-          provider: providerEnv,
-          model: modelToUse,
-          apiKey: env.COPILOT_API_KEY,
-        }
-      }
+    if (!providerConfig) {
+      logger.warn('No provider configuration found, using server defaults')
+    } else {
+      logger.info(`Using provider configuration`, {
+        provider: providerConfig.provider,
+        model: modelToUse,
+      })
     }
 
     // Determine conversationId to use for this request
@@ -476,11 +460,19 @@ export async function POST(req: NextRequest) {
       })
     } catch {}
 
-    const simAgentResponse = await fetch(`${SIM_AGENT_API_URL}/api/chat-completion-streaming`, {
+    // Determine the API URL based on provider configuration
+    let apiUrl = SIM_AGENT_API_URL
+    
+    // For openai-compatible provider, use custom base URL
+    if (providerConfig?.provider === 'openai-compatible' && providerConfig.baseUrl) {
+      apiUrl = providerConfig.baseUrl
+    }
+
+    const simAgentResponse = await fetch(`${apiUrl}/api/chat-completion-streaming`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(env.COPILOT_API_KEY ? { 'x-api-key': env.COPILOT_API_KEY } : {}),
+        ...(providerConfig?.apiKey ? { 'x-api-key': providerConfig.apiKey } : {}),
       },
       body: JSON.stringify(requestPayload),
     })

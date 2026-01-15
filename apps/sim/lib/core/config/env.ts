@@ -29,9 +29,10 @@ export const env = createEnv({
     INTERNAL_API_SECRET:                   z.string().min(32),                     // Secret for internal API authentication
 
     // Copilot
-    COPILOT_PROVIDER:                      z.string().optional(),                  // Provider for copilot API calls
+    COPILOT_PROVIDER:                      z.string().optional(),                  // Provider for copilot API calls (sim, openai-compatible, mistral, azure-openai, vertex)
     COPILOT_MODEL:                         z.string().optional(),                  // Model for copilot API calls
-    COPILOT_API_KEY:                       z.string().min(1).optional(),           // Secret for internal sim agent API authentication
+    COPILOT_API_KEY:                       z.string().min(1).optional(),           // API key for copilot provider (sim.ai, openai-compatible, etc.)
+    COPILOT_BASE_URL:                      z.string().url().optional(),            // Base URL for openai-compatible providers (e.g., https://api.z.ai/v1)
     SIM_AGENT_API_URL:                     z.string().url().optional(),            // URL for internal sim agent API
     AGENT_INDEXER_URL:                     z.string().url().optional(),            // URL for agent training data indexer
     AGENT_INDEXER_API_KEY:                 z.string().min(1).optional(),           // API key for agent indexer authentication

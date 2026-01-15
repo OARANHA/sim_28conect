@@ -19,6 +19,8 @@ const VALID_PROVIDER_IDS: readonly ProviderId[] = [
   'mistral',
   'groq',
   'ollama',
+  'openai-compatible',
+  'z-ai',
 ] as const
 
 /**
