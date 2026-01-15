@@ -33,6 +33,26 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang='en' suppressHydrationWarning>
       <head>
+        {/* Crypto polyfill - must run before any other scripts */}
+        <script
+          id='crypto-polyfill'
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function() {
+                if (typeof crypto !== 'undefined' && typeof crypto.randomUUID !== 'function') {
+                  crypto.randomUUID = function() {
+                    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                      var r = (Math.random() * 16) | 0;
+                      var v = c === 'x' ? r : (r & 0x3) | 0x8;
+                      return v.toString(16);
+                    });
+                  };
+                }
+              })();
+            `,
+          }}
+        />
+
         {/* Structured Data for SEO */}
         <script
           type='application/ld+json'
