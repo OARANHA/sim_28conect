@@ -293,16 +293,17 @@ export async function POST(req: NextRequest) {
     const defaults = getCopilotModel('chat')
     const modelToUse = env.COPILOT_MODEL || defaults.model
 
-    // Get provider configuration - pass override from UI if present
+    // Get provider configuration - use provider from request body (comes from UI selector)
     const providerConfig = getProviderConfig(provider)
 
     if (!providerConfig) {
-      logger.warn('No provider configuration found, using server defaults')
+      logger.warn(`[${tracker.requestId}] No provider configuration found, using server defaults`)
     } else {
-      logger.info(`Using provider configuration`, {
+      logger.info(`[${tracker.requestId}] Using provider configuration`, {
         provider: providerConfig.provider,
         model: modelToUse,
         isOverride: !!provider,
+        selectedFromUI: !!provider,
       })
     }
 
@@ -459,6 +460,7 @@ export async function POST(req: NextRequest) {
         hasBaseTools: baseTools.length > 0,
         baseToolCount: baseTools.length,
         hasCredentials: !!credentials,
+        usingProvider: providerConfig?.provider || 'default',
       })
     } catch {}
 
