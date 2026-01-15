@@ -17,7 +17,7 @@ import {
   TooltipTrigger
 } from '@/components/ui/tooltip'
 import { Badge } from '@/components/ui/badge'
-import { cn } from '@/components/emcn'
+import { cn } from '@/lib/core/utils/cn'
 
 interface Provider {
   id: string
