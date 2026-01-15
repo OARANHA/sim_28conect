@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { GithubIcon } from '@/components/icons'
 import { useBrandConfig } from '@/lib/branding/branding'
 import { inter } from '@/app/_styles/fonts/inter/inter'
+import { ProviderSelector } from '@/components/copilot/provider-selector'
 
 interface ChatHeaderProps {
   chatConfig: {
@@ -45,6 +46,13 @@ export function ChatHeader({ chatConfig, starCount }: ChatHeaderProps) {
             {chatConfig?.customizations?.headerText || chatConfig?.title || 'Chat'}
           </h2>
         </div>
+        
+        {/* Copilot Provider Selector - only show when no custom branding */}
+        {!brand.logoUrl && (
+          <div className='hidden lg:flex'>
+            <ProviderSelector />
+          </div>
+        )}
       </div>
 
       {!brand.logoUrl && (
