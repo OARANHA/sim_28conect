@@ -1,5 +1,6 @@
 import { createLogger } from '@sim/logger'
 import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
 import type { OpenRouterModelInfo, ProvidersStore } from './types'
 
 const logger = createLogger('ProvidersStore')
@@ -57,3 +58,24 @@ export const useProvidersStore = create<ProvidersStore>((set, get) => ({
     return get().openRouterModelInfo[modelId]
   },
 }))
+
+/**
+ * Store for user's runtime provider selection in chat UI
+ * null = use environment variable default
+ * 'openai' | 'anthropic' = override with specific provider
+ */
+export const useProviderSelectionStore = create<{
+  selectedProvider: 'openai' | 'anthropic' | null
+  setSelectedProvider: (provider: 'openai' | 'anthropic' | null) => void
+}>()(persist(
+  (set) => ({
+    selectedProvider: null,
+    setSelectedProvider: (provider) => {
+      logger.info('Provider selection changed', { provider })
+      set({ selectedProvider: provider })
+    },
+  }),
+  {
+    name: 'provider-selection-store',
+  }
+))
