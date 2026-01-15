@@ -5,11 +5,13 @@ import type { CopilotProviderConfig } from '@/lib/copilot/types'
 const logger = createLogger('CopilotProviders')
 
 /**
- * Get the provider configuration based on environment variables
+ * Get the provider configuration based on environment variables or runtime override
  * Supports multiple providers: sim, openai-compatible, mistral, azure-openai, vertex
+ * @param providerOverride - Optional provider override from UI selection
  */
-export function getProviderConfig(): CopilotProviderConfig | undefined {
-  const provider = env.COPILOT_PROVIDER || 'sim'
+export function getProviderConfig(providerOverride?: string): CopilotProviderConfig | undefined {
+  // Use override if provided, otherwise fall back to environment variable
+  const provider = providerOverride || env.COPILOT_PROVIDER || 'sim'
   const model = env.COPILOT_MODEL || 'claude-3-7-sonnet-latest'
 
   logger.info(`Initializing Copilot with provider: ${provider}`, {
@@ -17,6 +19,7 @@ export function getProviderConfig(): CopilotProviderConfig | undefined {
     model,
     hasApiKey: !!env.COPILOT_API_KEY,
     hasBaseUrl: !!env.COPILOT_BASE_URL,
+    isOverride: !!providerOverride,
   })
 
   // Default sim.ai provider (managed service)
