@@ -70,7 +70,7 @@ const ChatMessageSchema = z.object({
   stream: z.boolean().optional().default(true),
   implicitFeedback: z.string().optional(),
   fileAttachments: z.array(FileAttachmentSchema).optional(),
-  provider: z.string().optional().default('openai'),
+  provider: z.string().optional(), // Runtime provider selection from UI
   conversationId: z.string().optional(),
   contexts: z
     .array(
@@ -148,6 +148,7 @@ export async function POST(req: NextRequest) {
               label: c?.label,
             }))
           : undefined,
+        providerOverride: provider, // Log provider selection
       })
     } catch {}
     // Preprocess contexts server-side
@@ -292,8 +293,8 @@ export async function POST(req: NextRequest) {
     const defaults = getCopilotModel('chat')
     const modelToUse = env.COPILOT_MODEL || defaults.model
 
-    // Get provider configuration using factory function
-    const providerConfig = getProviderConfig()
+    // Get provider configuration - pass override from UI if present
+    const providerConfig = getProviderConfig(provider)
 
     if (!providerConfig) {
       logger.warn('No provider configuration found, using server defaults')
@@ -301,6 +302,7 @@ export async function POST(req: NextRequest) {
       logger.info(`Using provider configuration`, {
         provider: providerConfig.provider,
         model: modelToUse,
+        isOverride: !!provider,
       })
     }
 
