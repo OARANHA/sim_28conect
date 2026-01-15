@@ -47,9 +47,9 @@ export function ChatHeader({ chatConfig, starCount }: ChatHeaderProps) {
           </h2>
         </div>
         
-        {/* Copilot Provider Selector - only show when no custom branding */}
+        {/* Copilot Provider Selector - visible on all screens */}
         {!brand.logoUrl && (
-          <div className='hidden lg:flex'>
+          <div className='flex'>
             <ProviderSelector />
           </div>
         )}
