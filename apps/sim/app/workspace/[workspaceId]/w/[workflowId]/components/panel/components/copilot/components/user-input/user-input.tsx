@@ -21,6 +21,7 @@ import {
   MentionMenu,
   ModelSelector,
   ModeSelector,
+  ProviderSelector,
 } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/copilot/components/user-input/components'
 import { NEAR_TOP_THRESHOLD } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/copilot/components/user-input/constants'
 import {
@@ -551,7 +552,7 @@ const UserInput = forwardRef<UserInputRef, UserInputProps>(
 
       // Handle empty message
       if (!message) {
-        return <span>{'\u00A0'}</span>
+        return <span>{' '}</span>
       }
 
       // If no contexts, render the message directly with proper newline handling
@@ -605,7 +606,7 @@ const UserInput = forwardRef<UserInputRef, UserInputProps>(
       }
 
       // Ensure there's always something to render for height calculation
-      return elements.length > 0 ? elements : <span>{'\u00A0'}</span>
+      return elements.length > 0 ? elements : <span>{' '}</span>
     }, [message, contextManagement.selectedContexts, mentionTokensWithContext])
 
     return (
@@ -719,9 +720,9 @@ const UserInput = forwardRef<UserInputRef, UserInputProps>(
               )}
           </div>
 
-          {/* Bottom Row: Mode Selector + Model Selector + Attach Button + Send Button */}
+          {/* Bottom Row: Mode Selector + Provider Selector + Model Selector + Attach Button + Send Button */}
           <div className='flex items-center justify-between gap-2'>
-            {/* Left side: Mode Selector + Model Selector */}
+            {/* Left side: Mode Selector + Provider Selector + Model Selector */}
             <div className='flex min-w-0 flex-1 items-center gap-[8px]'>
               {!hideModeSelector && (
                 <ModeSelector
@@ -731,6 +732,8 @@ const UserInput = forwardRef<UserInputRef, UserInputProps>(
                   disabled={disabled}
                 />
               )}
+
+              <ProviderSelector isNearTop={isNearTop} />
 
               <ModelSelector
                 selectedModel={selectedModel}
