@@ -5,12 +5,9 @@ x-build-args: &build-args
 
 services:
   simstudio:
-    build:
-      context: .
-      dockerfile: docker/app.Dockerfile
-      args: *build-args
-    image: simv4-simstudio:latest
-    container_name: simstudio-app
+    # Em Swarm não dá para buildar direto no stack; a imagem precisa existir antes.
+    # Faça o build e push dessa imagem (ex.: docker build && docker push seu-user/simv4-simstudio:latest)
+    image: seu-user/simv4-simstudio:latest
     ports:
       - '${APP_PORT:-3000}:3000'
     environment:
@@ -47,12 +44,17 @@ services:
       - db
       - migrations
       - realtime
-    restart: unless-stopped
     deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
       resources:
         limits:
           memory: 10G
           cpus: '6'
+      placement:
+        constraints:
+          - node.role == worker
     healthcheck:
       test: ['CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3000']
       interval: 90s
@@ -64,7 +66,6 @@ services:
 
   realtime:
     image: ghcr.io/simstudioai/realtime:latest
-    container_name: simstudio-realtime
     ports:
       - '${REALTIME_PORT:-3002}:3002'
     environment:
@@ -76,8 +77,10 @@ services:
       - SOCKET_PORT=${REALTIME_PORT:-3002}
     depends_on:
       - db
-    restart: unless-stopped
     deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
       resources:
         limits:
           memory: 4G
@@ -92,7 +95,6 @@ services:
 
   migrations:
     image: ghcr.io/simstudioai/migrations:latest
-    container_name: simstudio-migrations
     working_dir: /app/packages/db
     environment:
       - NODE_ENV=production
@@ -100,14 +102,15 @@ services:
     depends_on:
       - db
     command: ['bun', 'run', 'db:migrate']
-    restart: 'no'
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: none
     networks:
       - sim-network
 
   db:
     image: pgvector/pgvector:pg17
-    container_name: simstudio-postgres
-    restart: always
     ports:
       - '${POSTGRES_PORT:-5432}:5432'
     volumes:
@@ -121,12 +124,15 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    deploy:
+      restart_policy:
+        condition: any
     networks:
       - sim-network
 
 networks:
   sim-network:
-    driver: bridge
+    driver: overlay   # obrigatório para Swarm
 
 volumes:
   postgres_data:
