@@ -68,9 +68,11 @@ WORKDIR /app/apps/sim
 RUN --mount=type=cache,id=bun-cache,target=/root/.bun/install/cache \
     HUSKY=0 bun install sharp --linker=hoisted
 
+# Optimize for lower memory usage
 ENV NEXT_TELEMETRY_DISABLED=1 \
     VERCEL_TELEMETRY_DISABLED=1 \
-    DOCKER_BUILD=1
+    DOCKER_BUILD=1 \
+    NODE_OPTIONS="--max-old-space-size=2048"
 
 WORKDIR /app
 
@@ -84,7 +86,8 @@ ENV DATABASE_URL=${DATABASE_URL}
 ARG NEXT_PUBLIC_APP_URL="http://localhost:3000"
 ENV NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
 
-RUN bun run build
+# Build with memory limit and error recovery
+RUN bun run build || (echo "Build failed, retrying with lower concurrency..." && NODE_OPTIONS="--max-old-space-size=3072" bun run build)
 
 # ========================================
 # Runner Stage: Run the actual app
