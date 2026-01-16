@@ -405,5 +405,3325 @@ function abortAllInProgressTools(set: any, get: () => CopilotStore) {
   } catch {}
 }
 
-// CONTINUA NO PRÓXIMO COMENTÁRIO...
-// (devido ao limite de caracteres, vou dividir o arquivo)
+// Normalize loaded messages so assistant messages render correctly from DB
+/**
+ * Loads messages from DB for UI rendering.
+ * Messages are stored exactly as they render, so we just need to:
+ * 1. Register client tool instances for any tool calls
+ * 2. Return the messages as-is
+ */
+function normalizeMessagesForUI(messages: CopilotMessage[]): CopilotMessage[] {
+  try {
+    // Log what we're loading
+    for (const message of messages) {
+      if (message.role === 'assistant') {
+        logger.info('[normalizeMessagesForUI] Loading assistant message', {
+          id: message.id,
+          hasContent: !!message.content?.trim(),
+          contentBlockCount: message.contentBlocks?.length || 0,
+          contentBlockTypes: (message.contentBlocks as any[])?.map((b) => b?.type) || [],
+        })
+      }
+    }
+
+    // Register client tool instances for all tool calls so they can be looked up
+    for (const message of messages) {
+      if (message.contentBlocks) {
+        for (const block of message.contentBlocks as any[]) {
+          if (block?.type === 'tool_call' && block.toolCall) {
+            registerToolCallInstances(block.toolCall)
+          }
+        }
+      }
+    }
+    // Return messages as-is - they're already in the correct format for rendering
+    return messages
+  } catch {
+    return messages
+  }
+}
+
+/**
+ * Recursively registers client tool instances for a tool call and its nested subagent tool calls.
+ */
+function registerToolCallInstances(toolCall: any): void {
+  if (!toolCall?.id) return
+  ensureClientToolInstance(toolCall.name, toolCall.id)
+
+  // Register nested subagent tool calls
+  if (Array.isArray(toolCall.subAgentBlocks)) {
+    for (const block of toolCall.subAgentBlocks) {
+      if (block?.type === 'subagent_tool_call' && block.toolCall) {
+        registerToolCallInstances(block.toolCall)
+      }
+    }
+  }
+  if (Array.isArray(toolCall.subAgentToolCalls)) {
+    for (const subTc of toolCall.subAgentToolCalls) {
+      registerToolCallInstances(subTc)
+    }
+  }
+}
+
+// Simple object pool for content blocks
+class ObjectPool<T> {
+  private pool: T[] = []
+  private createFn: () => T
+  private resetFn: (obj: T) => void
+
+  constructor(createFn: () => T, resetFn: (obj: T) => void, initialSize = 5) {
+    this.createFn = createFn
+    this.resetFn = resetFn
+    for (let i = 0; i < initialSize; i++) this.pool.push(createFn())
+  }
+  get(): T {
+    const obj = this.pool.pop()
+    if (obj) {
+      this.resetFn(obj)
+      return obj
+    }
+    return this.createFn()
+  }
+  release(obj: T): void {
+    if (this.pool.length < 20) this.pool.push(obj)
+  }
+}
+
+const contentBlockPool = new ObjectPool(
+  () => ({ type: '', content: '', timestamp: 0, toolCall: null as any }),
+  (obj) => {
+    obj.type = ''
+    obj.content = ''
+    obj.timestamp = 0
+    ;(obj as any).toolCall = null
+    ;(obj as any).startTime = undefined
+    ;(obj as any).duration = undefined
+  }
+)
+
+// Efficient string builder
+class StringBuilder {
+  private parts: string[] = []
+  private length = 0
+  append(str: string): void {
+    this.parts.push(str)
+    this.length += str.length
+  }
+  toString(): string {
+    const result = this.parts.join('')
+    this.clear()
+    return result
+  }
+  clear(): void {
+    this.parts.length = 0
+    this.length = 0
+  }
+  get size(): number {
+    return this.length
+  }
+}
+
+// Helpers
+function createUserMessage(
+  content: string,
+  fileAttachments?: MessageFileAttachment[],
+  contexts?: ChatContext[],
+  messageId?: string
+): CopilotMessage {
+  return {
+    id: messageId || crypto.randomUUID(),
+    role: 'user',
+    content,
+    timestamp: new Date().toISOString(),
+    ...(fileAttachments && fileAttachments.length > 0 && { fileAttachments }),
+    ...(contexts && contexts.length > 0 && { contexts }),
+    ...(contexts &&
+      contexts.length > 0 && {
+        contentBlocks: [
+          { type: 'contexts', contexts: contexts as any, timestamp: Date.now() },
+        ] as any,
+      }),
+  }
+}
+
+function createStreamingMessage(): CopilotMessage {
+  return {
+    id: crypto.randomUUID(),
+    role: 'assistant',
+    content: '',
+    timestamp: new Date().toISOString(),
+  }
+}
+
+function createErrorMessage(
+  messageId: string,
+  content: string,
+  errorType?: 'usage_limit' | 'unauthorized' | 'forbidden' | 'rate_limit' | 'upgrade_required'
+): CopilotMessage {
+  return {
+    id: messageId,
+    role: 'assistant',
+    content,
+    timestamp: new Date().toISOString(),
+    contentBlocks: [
+      {
+        type: 'text',
+        content,
+        timestamp: Date.now(),
+      },
+    ],
+    errorType,
+  }
+}
+
+function stripTodoTags(text: string): string {
+  if (!text) return text
+  return text
+    .replace(/<marktodo>[\s\S]*?<\/marktodo>/g, '')
+    .replace(/<checkofftodo>[\s\S]*?<\/checkofftodo>/g, '')
+    .replace(/<design_workflow>[\s\S]*?<\/design_workflow>/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{2,}/g, '\n')
+}
+
+/**
+ * Deep clones an object using JSON serialization.
+ * This ensures we strip any non-serializable data (functions, circular refs).
+ */
+function deepClone<T>(obj: T): T {
+  try {
+    const json = JSON.stringify(obj)
+    if (!json || json === 'undefined') {
+      logger.warn('[deepClone] JSON.stringify returned empty for object', {
+        type: typeof obj,
+        isArray: Array.isArray(obj),
+        length: Array.isArray(obj) ? obj.length : undefined,
+      })
+      return obj
+    }
+    const parsed = JSON.parse(json)
+    // Verify the clone worked
+    if (Array.isArray(obj) && (!Array.isArray(parsed) || parsed.length !== obj.length)) {
+      logger.warn('[deepClone] Array clone mismatch', {
+        originalLength: obj.length,
+        clonedLength: Array.isArray(parsed) ? parsed.length : 'not array',
+      })
+    }
+    return parsed
+  } catch (err) {
+    logger.error('[deepClone] Failed to clone object', {
+      error: String(err),
+      type: typeof obj,
+      isArray: Array.isArray(obj),
+    })
+    return obj
+  }
+}
+
+/**
+ * Serializes messages for database storage.
+ * Deep clones all fields to ensure proper JSON serialization.
+ * This ensures they render identically when loaded back.
+ */
+function serializeMessagesForDB(messages: CopilotMessage[]): any[] {
+  const result = messages
+    .map((msg) => {
+      // Deep clone the entire message to ensure all nested data is serializable
+      // Ensure timestamp is always a string (Zod schema requires it)
+      let timestamp: string = msg.timestamp
+      if (typeof timestamp !== 'string') {
+        const ts = timestamp as any
+        timestamp = ts instanceof Date ? ts.toISOString() : new Date().toISOString()
+      }
+
+      const serialized: any = {
+        id: msg.id,
+        role: msg.role,
+        content: msg.content || '',
+        timestamp,
+      }
+
+      // Deep clone contentBlocks (the main rendering data)
+      if (Array.isArray(msg.contentBlocks) && msg.contentBlocks.length > 0) {
+        serialized.contentBlocks = deepClone(msg.contentBlocks)
+      }
+
+      // Deep clone toolCalls
+      if (Array.isArray((msg as any).toolCalls) && (msg as any).toolCalls.length > 0) {
+        serialized.toolCalls = deepClone((msg as any).toolCalls)
+      }
+
+      // Deep clone file attachments
+      if (Array.isArray(msg.fileAttachments) && msg.fileAttachments.length > 0) {
+        serialized.fileAttachments = deepClone(msg.fileAttachments)
+      }
+
+      // Deep clone contexts
+      if (Array.isArray((msg as any).contexts) && (msg as any).contexts.length > 0) {
+        serialized.contexts = deepClone((msg as any).contexts)
+      }
+
+      // Deep clone citations
+      if (Array.isArray(msg.citations) && msg.citations.length > 0) {
+        serialized.citations = deepClone(msg.citations)
+      }
+
+      // Copy error type
+      if (msg.errorType) {
+        serialized.errorType = msg.errorType
+      }
+
+      return serialized
+    })
+    .filter((msg) => {
+      // Filter out empty assistant messages
+      if (msg.role === 'assistant') {
+        const hasContent = typeof msg.content === 'string' && msg.content.trim().length > 0
+        const hasTools = Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0
+        const hasBlocks = Array.isArray(msg.contentBlocks) && msg.contentBlocks.length > 0
+        return hasContent || hasTools || hasBlocks
+      }
+      return true
+    })
+
+  // Log what we're serializing
+  for (const msg of messages) {
+    if (msg.role === 'assistant') {
+      logger.info('[serializeMessagesForDB] Input assistant message', {
+        id: msg.id,
+        hasContent: !!msg.content?.trim(),
+        contentBlockCount: msg.contentBlocks?.length || 0,
+        contentBlockTypes: (msg.contentBlocks as any[])?.map((b) => b?.type) || [],
+      })
+    }
+  }
+
+  logger.info('[serializeMessagesForDB] Serialized messages', {
+    inputCount: messages.length,
+    outputCount: result.length,
+    sample:
+      result.length > 0
+        ? {
+            role: result[result.length - 1].role,
+            hasContent: !!result[result.length - 1].content,
+            contentBlockCount: result[result.length - 1].contentBlocks?.length || 0,
+            toolCallCount: result[result.length - 1].toolCalls?.length || 0,
+          }
+        : null,
+  })
+
+  return result
+}
+
+/**
+ * @deprecated Use serializeMessagesForDB instead.
+ */
+function validateMessagesForLLM(messages: CopilotMessage[]): any[] {
+  return serializeMessagesForDB(messages)
+}
+
+/**
+ * Extracts all tool calls from a toolCall object, including nested subAgentBlocks.
+ * Adds them to the provided map.
+ */
+function extractToolCallsRecursively(
+  toolCall: CopilotToolCall,
+  map: Record<string, CopilotToolCall>
+): void {
+  if (!toolCall?.id) return
+  map[toolCall.id] = toolCall
+
+  // Extract nested tool calls from subAgentBlocks
+  if (Array.isArray(toolCall.subAgentBlocks)) {
+    for (const block of toolCall.subAgentBlocks) {
+      if (block?.type === 'subagent_tool_call' && block.toolCall?.id) {
+        extractToolCallsRecursively(block.toolCall, map)
+      }
+    }
+  }
+
+  // Extract from subAgentToolCalls as well
+  if (Array.isArray(toolCall.subAgentToolCalls)) {
+    for (const subTc of toolCall.subAgentToolCalls) {
+      extractToolCallsRecursively(subTc, map)
+    }
+  }
+}
+
+/**
+ * Builds a complete toolCallsById map from normalized messages.
+ * Extracts all tool calls including nested subagent tool calls.
+ */
+function buildToolCallsById(messages: CopilotMessage[]): Record<string, CopilotToolCall> {
+  const toolCallsById: Record<string, CopilotToolCall> = {}
+  for (const msg of messages) {
+    if (msg.contentBlocks) {
+      for (const block of msg.contentBlocks as any[]) {
+        if (block?.type === 'tool_call' && block.toolCall?.id) {
+          extractToolCallsRecursively(block.toolCall, toolCallsById)
+        }
+      }
+    }
+  }
+  return toolCallsById
+}
+
+// Streaming context and SSE parsing
+interface StreamingContext {
+  messageId: string
+  accumulatedContent: StringBuilder
+  contentBlocks: any[]
+  currentTextBlock: any | null
+  isInThinkingBlock: boolean
+  currentThinkingBlock: any | null
+  isInDesignWorkflowBlock: boolean
+  designWorkflowContent: string
+  pendingContent: string
+  newChatId?: string
+  doneEventCount: number
+  streamComplete?: boolean
+  /** Track active subagent sessions by parent tool call ID */
+  subAgentParentToolCallId?: string
+  /** Track subagent content per parent tool call */
+  subAgentContent: Record<string, string>
+  /** Track subagent tool calls per parent tool call */
+  subAgentToolCalls: Record<string, CopilotToolCall[]>
+  /** Track subagent streaming blocks per parent tool call */
+  subAgentBlocks: Record<string, any[]>
+}
+
+type SSEHandler = (
+  data: any,
+  context: StreamingContext,
+  get: () => CopilotStore,
+  set: any
+) => Promise<void> | void
+
+const sseHandlers: Record<string, SSEHandler> = {
+  chat_id: async (data, context, get) => {
+    context.newChatId = data.chatId
+    const { currentChat } = get()
+    if (!currentChat && context.newChatId) {
+      await get().handleNewChatCreation(context.newChatId)
+    }
+  },
+  tool_result: (data, context, get, set) => {
+    try {
+      const toolCallId: string | undefined = data?.toolCallId || data?.data?.id
+      const success: boolean | undefined = data?.success
+      const failedDependency: boolean = data?.failedDependency === true
+      const skipped: boolean = data?.result?.skipped === true
+      if (!toolCallId) return
+      const { toolCallsById } = get()
+      const current = toolCallsById[toolCallId]
+      if (current) {
+        if (
+          isRejectedState(current.state) ||
+          isReviewState(current.state) ||
+          isBackgroundState(current.state)
+        ) {
+          // Preserve terminal review/rejected state; do not override
+          return
+        }
+        const targetState = success
+          ? ClientToolCallState.success
+          : failedDependency || skipped
+            ? ClientToolCallState.rejected
+            : ClientToolCallState.error
+        const updatedMap = { ...toolCallsById }
+        updatedMap[toolCallId] = {
+          ...current,
+          state: targetState,
+          display: resolveToolDisplay(
+            current.name,
+            targetState,
+            current.id,
+            (current as any).params
+          ),
+        }
+        set({ toolCallsById: updatedMap })
+
+        // If checkoff_todo succeeded, mark todo as completed in planTodos
+        if (targetState === ClientToolCallState.success && current.name === 'checkoff_todo') {
+          try {
+            const result = data?.result || data?.data?.result || {}
+            const input = (current as any).params || (current as any).input || {}
+            const todoId = input.id || input.todoId || result.id || result.todoId
+            if (todoId) {
+              get().updatePlanTodoStatus(todoId, 'completed')
+            }
+          } catch {}
+        }
+
+        // If mark_todo_in_progress succeeded, set todo executing in planTodos
+        if (
+          targetState === ClientToolCallState.success &&
+          current.name === 'mark_todo_in_progress'
+        ) {
+          try {
+            const result = data?.result || data?.data?.result || {}
+            const input = (current as any).params || (current as any).input || {}
+            const todoId = input.id || input.todoId || result.id || result.todoId
+            if (todoId) {
+              get().updatePlanTodoStatus(todoId, 'executing')
+            }
+          } catch {}
+        }
+      }
+
+      // Update inline content block state
+      for (let i = 0; i < context.contentBlocks.length; i++) {
+        const b = context.contentBlocks[i] as any
+        if (b?.type === 'tool_call' && b?.toolCall?.id === toolCallId) {
+          if (
+            isRejectedState(b.toolCall?.state) ||
+            isReviewState(b.toolCall?.state) ||
+            isBackgroundState(b.toolCall?.state)
+          )
+            break
+          const targetState = success
+            ? ClientToolCallState.success
+            : failedDependency || skipped
+              ? ClientToolCallState.rejected
+              : ClientToolCallState.error
+          context.contentBlocks[i] = {
+            ...b,
+            toolCall: {
+              ...b.toolCall,
+              state: targetState,
+              display: resolveToolDisplay(
+                b.toolCall?.name,
+                targetState,
+                toolCallId,
+                b.toolCall?.params
+              ),
+            },
+          }
+          break
+        }
+      }
+      updateStreamingMessage(set, context)
+    } catch {}
+  },
+  tool_error: (data, context, get, set) => {
+    try {
+      const toolCallId: string | undefined = data?.toolCallId || data?.data?.id
+      const failedDependency: boolean = data?.failedDependency === true
+      if (!toolCallId) return
+      const { toolCallsById } = get()
+      const current = toolCallsById[toolCallId]
+      if (current) {
+        if (
+          isRejectedState(current.state) ||
+          isReviewState(current.state) ||
+          isBackgroundState(current.state)
+        ) {
+          return
+        }
+        const targetState = failedDependency
+          ? ClientToolCallState.rejected
+          : ClientToolCallState.error
+        const updatedMap = { ...toolCallsById }
+        updatedMap[toolCallId] = {
+          ...current,
+          state: targetState,
+          display: resolveToolDisplay(
+            current.name,
+            targetState,
+            current.id,
+            (current as any).params
+          ),
+        }
+        set({ toolCallsById: updatedMap })
+      }
+      for (let i = 0; i < context.contentBlocks.length; i++) {
+        const b = context.contentBlocks[i] as any
+        if (b?.type === 'tool_call' && b?.toolCall?.id === toolCallId) {
+          if (
+            isRejectedState(b.toolCall?.state) ||
+            isReviewState(b.toolCall?.state) ||
+            isBackgroundState(b.toolCall?.state)
+          )
+            break
+          const targetState = failedDependency
+            ? ClientToolCallState.rejected
+            : ClientToolCallState.error
+          context.contentBlocks[i] = {
+            ...b,
+            toolCall: {
+              ...b.toolCall,
+              state: targetState,
+              display: resolveToolDisplay(
+                b.toolCall?.name,
+                targetState,
+                toolCallId,
+                b.toolCall?.params
+              ),
+            },
+          }
+          break
+        }
+      }
+      updateStreamingMessage(set, context)
+    } catch {}
+  },
+  tool_generating: (data, context, get, set) => {
+    const { toolCallId, toolName } = data
+    if (!toolCallId || !toolName) return
+    const { toolCallsById } = get()
+
+    // Ensure class-based client tool instances are registered (for interrupts/display)
+    ensureClientToolInstance(toolName, toolCallId)
+
+    if (!toolCallsById[toolCallId]) {
+      // Show as pending until we receive full tool_call (with arguments) to decide execution
+      const initialState = ClientToolCallState.pending
+      const tc: CopilotToolCall = {
+        id: toolCallId,
+        name: toolName,
+        state: initialState,
+        display: resolveToolDisplay(toolName, initialState, toolCallId),
+      }
+      const updated = { ...toolCallsById, [toolCallId]: tc }
+      set({ toolCallsById: updated })
+      logger.info('[toolCallsById] map updated', updated)
+
+      // Add/refresh inline content block
+      let found = false
+      for (let i = 0; i < context.contentBlocks.length; i++) {
+        const b = context.contentBlocks[i] as any
+        if (b.type === 'tool_call' && b.toolCall?.id === toolCallId) {
+          context.contentBlocks[i] = { ...b, toolCall: tc }
+          found = true
+          break
+        }
+      }
+      if (!found)
+        context.contentBlocks.push({ type: 'tool_call', toolCall: tc, timestamp: Date.now() })
+      updateStreamingMessage(set, context)
+    }
+  },
+  tool_call: (data, context, get, set) => {
+    const toolData = data?.data || {}
+    const id: string | undefined = toolData.id || data?.toolCallId
+    const name: string | undefined = toolData.name || data?.toolName
+    if (!id) return
+    const args = toolData.arguments
+    const isPartial = toolData.partial === true
+    const { toolCallsById } = get()
+
+    // Ensure class-based client tool instances are registered (for interrupts/display)
+    ensureClientToolInstance(name, id)
+
+    const existing = toolCallsById[id]
+    const next: CopilotToolCall = existing
+      ? {
+          ...existing,
+          state: ClientToolCallState.pending,
+          ...(args ? { params: args } : {}),
+          display: resolveToolDisplay(name, ClientToolCallState.pending, id, args),
+        }
+      : {
+          id,
+          name: name || 'unknown_tool',
+          state: ClientToolCallState.pending,
+          ...(args ? { params: args } : {}),
+          display: resolveToolDisplay(name, ClientToolCallState.pending, id, args),
+        }
+    const updated = { ...toolCallsById, [id]: next }
+    set({ toolCallsById: updated })
+    logger.info('[toolCallsById] → pending', { id, name, params: args })
+
+    // Ensure an inline content block exists/updated for this tool call
+    let found = false
+    for (let i = 0; i < context.contentBlocks.length; i++) {
+      const b = context.contentBlocks[i] as any
+      if (b.type === 'tool_call' && b.toolCall?.id === id) {
+        context.contentBlocks[i] = { ...b, toolCall: next }
+        found = true
+        break
+      }
+    }
+    if (!found) {
+      context.contentBlocks.push({ type: 'tool_call', toolCall: next, timestamp: Date.now() })
+    }
+    updateStreamingMessage(set, context)
+
+    // Prefer interface-based registry to determine interrupt and execute
+    try {
+      const def = name ? getTool(name) : undefined
+      if (def) {
+        const hasInterrupt =
+          typeof def.hasInterrupt === 'function'
+            ? !!def.hasInterrupt(args || {})
+            : !!def.hasInterrupt
+        if (!hasInterrupt && typeof def.execute === 'function') {
+          const ctx = createExecutionContext({ toolCallId: id, toolName: name || 'unknown_tool' })
+          // Defer executing transition by a tick to let pending render
+          setTimeout(() => {
+            // Guard against duplicate execution - check if already executing or terminal
+            const currentState = get().toolCallsById[id]?.state
+            if (currentState === ClientToolCallState.executing || isTerminalState(currentState)) {
+              return
+            }
+
+            const executingMap = { ...get().toolCallsById }
+            executingMap[id] = {
+              ...executingMap[id],
+              state: ClientToolCallState.executing,
+              display: resolveToolDisplay(name, ClientToolCallState.executing, id, args),
+            }
+            set({ toolCallsById: executingMap })
+            logger.info('[toolCallsById] pending → executing (registry)', { id, name })
+
+            // Update inline content block to executing
+            for (let i = 0; i < context.contentBlocks.length; i++) {
+              const b = context.contentBlocks[i] as any
+              if (b.type === 'tool_call' && b.toolCall?.id === id) {
+                context.contentBlocks[i] = {
+                  ...b,
+                  toolCall: { ...b.toolCall, state: ClientToolCallState.executing },
+                }
+                break
+              }
+            }
+            updateStreamingMessage(set, context)
+
+            Promise.resolve()
+              .then(async () => {
+                const result = await def.execute(ctx, args || {})
+                const success =
+                  result && typeof result.status === 'number'
+                    ? result.status >= 200 && result.status < 300
+                    : true
+                const completeMap = { ...get().toolCallsById }
+                // Do not override terminal review/rejected
+                if (
+                  isRejectedState(completeMap[id]?.state) ||
+                  isReviewState(completeMap[id]?.state) ||
+                  isBackgroundState(completeMap[id]?.state)
+                ) {
+                  return
+                }
+                completeMap[id] = {
+                  ...completeMap[id],
+                  state: success ? ClientToolCallState.success : ClientToolCallState.error,
+                  display: resolveToolDisplay(
+                    name,
+                    success ? ClientToolCallState.success : ClientToolCallState.error,
+                    id,
+                    args
+                  ),
+                }
+                set({ toolCallsById: completeMap })
+                logger.info(
+                  `[toolCallsById] executing → ${success ? 'success' : 'error'} (registry)`,
+                  { id, name }
+                )
+
+                // Notify backend tool mark-complete endpoint
+                try {
+                  await fetch('/api/copilot/tools/mark-complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      id,
+                      name: name || 'unknown_tool',
+                      status:
+                        typeof result?.status === 'number' ? result.status : success ? 200 : 500,
+                      message: result?.message,
+                      data: result?.data,
+                    }),
+                  })
+                } catch {}
+              })
+              .catch((e) => {
+                const errorMap = { ...get().toolCallsById }
+                // Do not override terminal review/rejected
+                if (
+                  isRejectedState(errorMap[id]?.state) ||
+                  isReviewState(errorMap[id]?.state) ||
+                  isBackgroundState(errorMap[id]?.state)
+                ) {
+                  return
+                }
+                errorMap[id] = {
+                  ...errorMap[id],
+                  state: ClientToolCallState.error,
+                  display: resolveToolDisplay(name, ClientToolCallState.error, id, args),
+                }
+                set({ toolCallsById: errorMap })
+                logger.error('Registry auto-execute tool failed', { id, name, error: e })
+              })
+          }, 0)
+          return
+        }
+      }
+    } catch (e) {
+      logger.warn('tool_call registry auto-exec check failed', { id, name, error: e })
+    }
+
+    // Class-based auto-exec for non-interrupt tools
+    try {
+      const inst = getClientTool(id) as any
+      const hasInterrupt = !!inst?.getInterruptDisplays?.()
+      if (!hasInterrupt && typeof inst?.execute === 'function') {
+        setTimeout(() => {
+          // Guard against duplicate execution - check if already executing or terminal
+          const currentState = get().toolCallsById[id]?.state
+          if (currentState === ClientToolCallState.executing || isTerminalState(currentState)) {
+            return
+          }
+
+          const executingMap = { ...get().toolCallsById }
+          executingMap[id] = {
+            ...executingMap[id],
+            state: ClientToolCallState.executing,
+            display: resolveToolDisplay(name, ClientToolCallState.executing, id, args),
+          }
+          set({ toolCallsById: executingMap })
+          logger.info('[toolCallsById] pending → executing (class)', { id, name })
+
+          Promise.resolve()
+            .then(async () => {
+              await inst.execute(args || {})
+              // Success/error will be synced via registerToolStateSync
+            })
+            .catch(() => {
+              const errorMap = { ...get().toolCallsById }
+              // Do not override terminal review/rejected
+              if (
+                isRejectedState(errorMap[id]?.state) ||
+                isReviewState(errorMap[id]?.state) ||
+                isBackgroundState(errorMap[id]?.state)
+              ) {
+                return
+              }
+              errorMap[id] = {
+                ...errorMap[id],
+                state: ClientToolCallState.error,
+                display: resolveToolDisplay(name, ClientToolCallState.error, id, args),
+              }
+              set({ toolCallsById: errorMap })
+            })
+        }, 0)
+        return
+      }
+    } catch {}
+
+    // Integration tools: Check if auto-allowed, otherwise wait for user confirmation
+    // This handles tools like google_calendar_*, exa_*, etc. that aren't in the client registry
+    // Only relevant if mode is 'build' (agent)
+    const { mode, workflowId, autoAllowedTools } = get()
+    if (mode === 'build' && workflowId) {
+      // Check if tool was NOT found in client registry (def is undefined from above)
+      const def = name ? getTool(name) : undefined
+      const inst = getClientTool(id) as any
+      if (!def && !inst && name) {
+        // Check if this tool is auto-allowed
+        if (autoAllowedTools.includes(name)) {
+          logger.info('[build mode] Integration tool auto-allowed, executing', { id, name })
+
+          // Auto-execute the tool
+          setTimeout(() => {
+            get().executeIntegrationTool(id)
+          }, 0)
+        } else {
+          // Integration tools stay in pending state until user confirms
+          logger.info('[build mode] Integration tool awaiting user confirmation', {
+            id,
+            name,
+          })
+        }
+      }
+    }
+  },
+  reasoning: (data, context, _get, set) => {
+    const phase = (data && (data.phase || data?.data?.phase)) as string | undefined
+    if (phase === 'start') {
+      if (!context.currentThinkingBlock) {
+        context.currentThinkingBlock = contentBlockPool.get()
+        context.currentThinkingBlock.type = THINKING_BLOCK_TYPE
+        context.currentThinkingBlock.content = ''
+        context.currentThinkingBlock.timestamp = Date.now()
+        ;(context.currentThinkingBlock as any).startTime = Date.now()
+        context.contentBlocks.push(context.currentThinkingBlock)
+      }
+      context.isInThinkingBlock = true
+      context.currentTextBlock = null
+      updateStreamingMessage(set, context)
+      return
+    }
+    if (phase === 'end') {
+      if (context.currentThinkingBlock) {
+        ;(context.currentThinkingBlock as any).duration =
+          Date.now() - ((context.currentThinkingBlock as any).startTime || Date.now())
+      }
+      context.isInThinkingBlock = false
+      context.currentThinkingBlock = null
+      context.currentTextBlock = null
+      updateStreamingMessage(set, context)
+      return
+    }
+    const chunk: string = typeof data?.data === 'string' ? data.data : data?.content || ''
+    if (!chunk) return
+    if (context.currentThinkingBlock) {
+      context.currentThinkingBlock.content += chunk
+    } else {
+      context.currentThinkingBlock = contentBlockPool.get()
+      context.currentThinkingBlock.type = THINKING_BLOCK_TYPE
+      context.currentThinkingBlock.content = chunk
+      context.currentThinkingBlock.timestamp = Date.now()
+      ;(context.currentThinkingBlock as any).startTime = Date.now()
+      context.contentBlocks.push(context.currentThinkingBlock)
+    }
+    context.isInThinkingBlock = true
+    context.currentTextBlock = null
+    updateStreamingMessage(set, context)
+  },
+  content: (data, context, get, set) => {
+    if (!data.data) return
+    context.pendingContent += data.data
+
+    let contentToProcess = context.pendingContent
+    let hasProcessedContent = false
+
+    const thinkingStartRegex = /<thinking>/
+    const thinkingEndRegex = /<\/thinking>/
+    const designWorkflowStartRegex = /<design_workflow>/
+    const designWorkflowEndRegex = /<\/design_workflow>/
+
+    const appendTextToContent = (text: string) => {
+      if (!text) return
+      context.accumulatedContent.append(text)
+      if (context.currentTextBlock && context.contentBlocks.length > 0) {
+        const lastBlock = context.contentBlocks[context.contentBlocks.length - 1]
+        if (lastBlock.type === TEXT_BLOCK_TYPE && lastBlock === context.currentTextBlock) {
+          lastBlock.content += text
+          return
+        }
+      }
+      context.currentTextBlock = contentBlockPool.get()
+      context.currentTextBlock.type = TEXT_BLOCK_TYPE
+      context.currentTextBlock.content = text
+      context.currentTextBlock.timestamp = Date.now()
+      context.contentBlocks.push(context.currentTextBlock)
+    }
+
+    while (contentToProcess.length > 0) {
+      // Handle design_workflow tags (takes priority over other content processing)
+      if (context.isInDesignWorkflowBlock) {
+        const endMatch = designWorkflowEndRegex.exec(contentToProcess)
+        if (endMatch) {
+          const designContent = contentToProcess.substring(0, endMatch.index)
+          context.designWorkflowContent += designContent
+          context.isInDesignWorkflowBlock = false
+
+          // Update store with complete design workflow content (available in all modes)
+          logger.info('[design_workflow] Tag complete, setting plan content', {
+            contentLength: context.designWorkflowContent.length,
+          })
+          set({ streamingPlanContent: context.designWorkflowContent })
+
+          contentToProcess = contentToProcess.substring(endMatch.index + endMatch[0].length)
+          hasProcessedContent = true
+        } else {
+          // Still in design_workflow block, accumulate content
+          context.designWorkflowContent += contentToProcess
+
+          // Update store with partial content for streaming effect (available in all modes)
+          set({ streamingPlanContent: context.designWorkflowContent })
+
+          contentToProcess = ''
+          hasProcessedContent = true
+        }
+        continue
+      }
+
+      if (!context.isInThinkingBlock && !context.isInDesignWorkflowBlock) {
+        // Check for design_workflow start tag first
+        const designStartMatch = designWorkflowStartRegex.exec(contentToProcess)
+        if (designStartMatch) {
+          const textBeforeDesign = contentToProcess.substring(0, designStartMatch.index)
+          if (textBeforeDesign) {
+            appendTextToContent(textBeforeDesign)
+            hasProcessedContent = true
+          }
+          context.isInDesignWorkflowBlock = true
+          context.designWorkflowContent = ''
+          contentToProcess = contentToProcess.substring(
+            designStartMatch.index + designStartMatch[0].length
+          )
+          hasProcessedContent = true
+          continue
+        }
+
+        const nextMarkIndex = contentToProcess.indexOf('<marktodo>')
+        const nextCheckIndex = contentToProcess.indexOf('<checkofftodo>')
+        const hasMark = nextMarkIndex >= 0
+        const hasCheck = nextCheckIndex >= 0
+
+        const nextTagIndex =
+          hasMark && hasCheck
+            ? Math.min(nextMarkIndex, nextCheckIndex)
+            : hasMark
+              ? nextMarkIndex
+              : hasCheck
+                ? nextCheckIndex
+                : -1
+
+        if (nextTagIndex >= 0) {
+          const isMarkTodo = hasMark && nextMarkIndex === nextTagIndex
+          const tagStart = isMarkTodo ? '<marktodo>' : '<checkofftodo>'
+          const tagEnd = isMarkTodo ? '</marktodo>' : '</checkofftodo>'
+          const closingIndex = contentToProcess.indexOf(tagEnd, nextTagIndex + tagStart.length)
+
+          if (closingIndex === -1) {
+            // Partial tag; wait for additional content
+            break
+          }
+
+          const todoId = contentToProcess
+            .substring(nextTagIndex + tagStart.length, closingIndex)
+            .trim()
+          logger.info(
+            isMarkTodo ? '[TODO] Detected marktodo tag' : '[TODO] Detected checkofftodo tag',
+            { todoId }
+          )
+
+          if (todoId) {
+            try {
+              get().updatePlanTodoStatus(todoId, isMarkTodo ? 'executing' : 'completed')
+              logger.info(
+                isMarkTodo
+                  ? '[TODO] Successfully marked todo in progress'
+                  : '[TODO] Successfully checked off todo',
+                { todoId }
+              )
+            } catch (e) {
+              logger.error(
+                isMarkTodo
+                  ? '[TODO] Failed to mark todo in progress'
+                  : '[TODO] Failed to checkoff todo',
+                { todoId, error: e }
+              )
+            }
+          } else {
+            logger.warn('[TODO] Empty todoId extracted from todo tag', { tagType: tagStart })
+          }
+
+          // Remove the tag AND newlines around it, but preserve ONE newline if both sides had them
+          let beforeTag = contentToProcess.substring(0, nextTagIndex)
+          let afterTag = contentToProcess.substring(closingIndex + tagEnd.length)
+
+          const hadNewlineBefore = /(\r?\n)+$/.test(beforeTag)
+          const hadNewlineAfter = /^(\r?\n)+/.test(afterTag)
+
+          // Strip trailing newlines before the tag
+          beforeTag = beforeTag.replace(/(\r?\n)+$/, '')
+          // Strip leading newlines after the tag
+          afterTag = afterTag.replace(/^(\r?\n)+/, '')
+
+          // If there were newlines on both sides, add back ONE to preserve paragraph breaks
+          contentToProcess =
+            beforeTag + (hadNewlineBefore && hadNewlineAfter ? '\n' : '') + afterTag
+          context.currentTextBlock = null
+          hasProcessedContent = true
+          continue
+        }
+      }
+
+      if (context.isInThinkingBlock) {
+        const endMatch = thinkingEndRegex.exec(contentToProcess)
+        if (endMatch) {
+          const thinkingContent = contentToProcess.substring(0, endMatch.index)
+          if (context.currentThinkingBlock) {
+            context.currentThinkingBlock.content += thinkingContent
+          } else {
+            context.currentThinkingBlock = contentBlockPool.get()
+            context.currentThinkingBlock.type = THINKING_BLOCK_TYPE
+            context.currentThinkingBlock.content = thinkingContent
+            context.currentThinkingBlock.timestamp = Date.now()
+            context.currentThinkingBlock.startTime = Date.now()
+            context.contentBlocks.push(context.currentThinkingBlock)
+          }
+          context.isInThinkingBlock = false
+          if (context.currentThinkingBlock) {
+            context.currentThinkingBlock.duration =
+              Date.now() - (context.currentThinkingBlock.startTime || Date.now())
+          }
+          context.currentThinkingBlock = null
+          context.currentTextBlock = null
+          contentToProcess = contentToProcess.substring(endMatch.index + endMatch[0].length)
+          hasProcessedContent = true
+        } else {
+          if (context.currentThinkingBlock) {
+            context.currentThinkingBlock.content += contentToProcess
+          } else {
+            context.currentThinkingBlock = contentBlockPool.get()
+            context.currentThinkingBlock.type = THINKING_BLOCK_TYPE
+            context.currentThinkingBlock.content = contentToProcess
+            context.currentThinkingBlock.timestamp = Date.now()
+            context.currentThinkingBlock.startTime = Date.now()
+            context.contentBlocks.push(context.currentThinkingBlock)
+          }
+          contentToProcess = ''
+          hasProcessedContent = true
+        }
+      } else {
+        const startMatch = thinkingStartRegex.exec(contentToProcess)
+        if (startMatch) {
+          const textBeforeThinking = contentToProcess.substring(0, startMatch.index)
+          if (textBeforeThinking) {
+            context.accumulatedContent.append(textBeforeThinking)
+            if (context.currentTextBlock && context.contentBlocks.length > 0) {
+              const lastBlock = context.contentBlocks[context.contentBlocks.length - 1]
+              if (lastBlock.type === TEXT_BLOCK_TYPE && lastBlock === context.currentTextBlock) {
+                lastBlock.content += textBeforeThinking
+              } else {
+                context.currentTextBlock = contentBlockPool.get()
+                context.currentTextBlock.type = TEXT_BLOCK_TYPE
+                context.currentTextBlock.content = textBeforeThinking
+                context.currentTextBlock.timestamp = Date.now()
+                context.contentBlocks.push(context.currentTextBlock)
+              }
+            } else {
+              context.currentTextBlock = contentBlockPool.get()
+              context.currentTextBlock.type = TEXT_BLOCK_TYPE
+              context.currentTextBlock.content = textBeforeThinking
+              context.currentTextBlock.timestamp = Date.now()
+              context.contentBlocks.push(context.currentTextBlock)
+            }
+            hasProcessedContent = true
+          }
+          context.isInThinkingBlock = true
+          context.currentTextBlock = null
+          contentToProcess = contentToProcess.substring(startMatch.index + startMatch[0].length)
+          hasProcessedContent = true
+        } else {
+          // Check if content might contain partial todo tags and hold them back
+          let partialTagIndex = contentToProcess.lastIndexOf('<')
+
+          // Also check for partial marktodo or checkofftodo tags
+          const partialMarkTodo = contentToProcess.lastIndexOf('<marktodo')
+          const partialCheckoffTodo = contentToProcess.lastIndexOf('<checkofftodo')
+
+          if (partialMarkTodo > partialTagIndex) {
+            partialTagIndex = partialMarkTodo
+          }
+          if (partialCheckoffTodo > partialTagIndex) {
+            partialTagIndex = partialCheckoffTodo
+          }
+
+          let textToAdd = contentToProcess
+          let remaining = ''
+          if (partialTagIndex >= 0 && partialTagIndex > contentToProcess.length - 50) {
+            textToAdd = contentToProcess.substring(0, partialTagIndex)
+            remaining = contentToProcess.substring(partialTagIndex)
+          }
+          if (textToAdd) {
+            context.accumulatedContent.append(textToAdd)
+            if (context.currentTextBlock && context.contentBlocks.length > 0) {
+              const lastBlock = context.contentBlocks[context.contentBlocks.length - 1]
+              if (lastBlock.type === TEXT_BLOCK_TYPE && lastBlock === context.currentTextBlock) {
+                lastBlock.content += textToAdd
+              } else {
+                context.currentTextBlock = contentBlockPool.get()
+                context.currentTextBlock.type = TEXT_BLOCK_TYPE
+                context.currentTextBlock.content = textToAdd
+                context.currentTextBlock.timestamp = Date.now()
+                context.contentBlocks.push(context.currentTextBlock)
+              }
+            } else {
+              context.currentTextBlock = contentBlockPool.get()
+              context.currentTextBlock.type = TEXT_BLOCK_TYPE
+              context.currentTextBlock.content = textToAdd
+              context.currentTextBlock.timestamp = Date.now()
+              context.contentBlocks.push(context.currentTextBlock)
+            }
+            hasProcessedContent = true
+          }
+          contentToProcess = remaining
+          break
+        }
+      }
+    }
+
+    context.pendingContent = contentToProcess
+    if (hasProcessedContent) {
+      updateStreamingMessage(set, context)
+    }
+  },
+  done: (_data, context) => {
+    context.doneEventCount++
+    if (context.doneEventCount >= 1) {
+      context.streamComplete = true
+    }
+  },
+  error: (data, context, _get, set) => {
+    logger.error('Stream error:', data.error)
+    set((state: CopilotStore) => ({
+      messages: state.messages.map((msg) =>
+        msg.id === context.messageId
+          ? {
+              ...msg,
+              content: context.accumulatedContent || 'An error occurred.',
+              error: data.error,
+            }
+          : msg
+      ),
+    }))
+    context.streamComplete = true
+  },
+  stream_end: (_data, context, _get, set) => {
+    if (context.pendingContent) {
+      if (context.isInThinkingBlock && context.currentThinkingBlock) {
+        context.currentThinkingBlock.content += context.pendingContent
+      } else if (context.pendingContent.trim()) {
+        context.accumulatedContent.append(context.pendingContent)
+        if (context.currentTextBlock && context.contentBlocks.length > 0) {
+          const lastBlock = context.contentBlocks[context.contentBlocks.length - 1]
+          if (lastBlock.type === TEXT_BLOCK_TYPE && lastBlock === context.currentTextBlock) {
+            lastBlock.content += context.pendingContent
+          } else {
+            context.currentTextBlock = contentBlockPool.get()
+            context.currentTextBlock.type = TEXT_BLOCK_TYPE
+            context.currentTextBlock.content = context.pendingContent
+            context.currentTextBlock.timestamp = Date.now()
+            context.contentBlocks.push(context.currentTextBlock)
+          }
+        } else {
+          context.currentTextBlock = contentBlockPool.get()
+          context.currentTextBlock.type = TEXT_BLOCK_TYPE
+          context.currentTextBlock.content = context.pendingContent
+          context.currentTextBlock.timestamp = Date.now()
+          context.contentBlocks.push(context.currentTextBlock)
+        }
+      }
+      context.pendingContent = ''
+    }
+    if (context.currentThinkingBlock) {
+      context.currentThinkingBlock.duration =
+        Date.now() - (context.currentThinkingBlock.startTime || Date.now())
+    }
+    context.isInThinkingBlock = false
+    context.currentThinkingBlock = null
+    context.currentTextBlock = null
+    updateStreamingMessage(set, context)
+  },
+  default: () => {},
+}
+
+/**
+ * Helper to update a tool call with subagent data in both toolCallsById and contentBlocks
+ */
+function updateToolCallWithSubAgentData(
+  context: StreamingContext,
+  get: () => CopilotStore,
+  set: any,
+  parentToolCallId: string
+) {
+  const { toolCallsById } = get()
+  const parentToolCall = toolCallsById[parentToolCallId]
+  if (!parentToolCall) {
+    logger.warn('[SubAgent] updateToolCallWithSubAgentData: parent tool call not found', {
+      parentToolCallId,
+      availableToolCallIds: Object.keys(toolCallsById),
+    })
+    return
+  }
+
+  // Prepare subagent blocks array for ordered display
+  const blocks = context.subAgentBlocks[parentToolCallId] || []
+
+  const updatedToolCall: CopilotToolCall = {
+    ...parentToolCall,
+    subAgentContent: context.subAgentContent[parentToolCallId] || '',
+    subAgentToolCalls: context.subAgentToolCalls[parentToolCallId] || [],
+    subAgentBlocks: blocks,
+    subAgentStreaming: true,
+  }
+
+  logger.info('[SubAgent] Updating tool call with subagent data', {
+    parentToolCallId,
+    parentToolName: parentToolCall.name,
+    subAgentContentLength: updatedToolCall.subAgentContent?.length,
+    subAgentBlocksCount: updatedToolCall.subAgentBlocks?.length,
+    subAgentToolCallsCount: updatedToolCall.subAgentToolCalls?.length,
+  })
+
+  // Update in toolCallsById
+  const updatedMap = { ...toolCallsById, [parentToolCallId]: updatedToolCall }
+  set({ toolCallsById: updatedMap })
+
+  // Update in contentBlocks
+  let foundInContentBlocks = false
+  for (let i = 0; i < context.contentBlocks.length; i++) {
+    const b = context.contentBlocks[i] as any
+    if (b.type === 'tool_call' && b.toolCall?.id === parentToolCallId) {
+      context.contentBlocks[i] = { ...b, toolCall: updatedToolCall }
+      foundInContentBlocks = true
+      break
+    }
+  }
+
+  if (!foundInContentBlocks) {
+    logger.warn('[SubAgent] Parent tool call not found in contentBlocks', {
+      parentToolCallId,
+      contentBlocksCount: context.contentBlocks.length,
+      toolCallBlockIds: context.contentBlocks
+        .filter((b: any) => b.type === 'tool_call')
+        .map((b: any) => b.toolCall?.id),
+    })
+  }
+
+  updateStreamingMessage(set, context)
+}
+
+/**
+ * SSE handlers for subagent events (events with subagent field set)
+ * These handle content and tool calls from subagents like debug
+ */
+const subAgentSSEHandlers: Record<string, SSEHandler> = {
+  // Handle subagent response start (ignore - just a marker)
+  start: () => {
+    // Subagent start event - no action needed, parent is already tracked from subagent_start
+  },
+
+  // Handle subagent text content (reasoning/thinking)
+  content: (data, context, get, set) => {
+    const parentToolCallId = context.subAgentParentToolCallId
+    logger.info('[SubAgent] content event', {
+      parentToolCallId,
+      hasData: !!data.data,
+      dataPreview: typeof data.data === 'string' ? data.data.substring(0, 50) : null,
+    })
+    if (!parentToolCallId || !data.data) {
+      logger.warn('[SubAgent] content missing parentToolCallId or data', {
+        parentToolCallId,
+        hasData: !!data.data,
+      })
+      return
+    }
+
+    // Initialize if needed
+    if (!context.subAgentContent[parentToolCallId]) {
+      context.subAgentContent[parentToolCallId] = ''
+    }
+    if (!context.subAgentBlocks[parentToolCallId]) {
+      context.subAgentBlocks[parentToolCallId] = []
+    }
+
+    // Append content
+    context.subAgentContent[parentToolCallId] += data.data
+
+    // Update or create the last text block in subAgentBlocks
+    const blocks = context.subAgentBlocks[parentToolCallId]
+    const lastBlock = blocks[blocks.length - 1]
+    if (lastBlock && lastBlock.type === 'subagent_text') {
+      lastBlock.content = (lastBlock.content || '') + data.data
+    } else {
+      blocks.push({
+        type: 'subagent_text',
+        content: data.data,
+        timestamp: Date.now(),
+      })
+    }
+
+    updateToolCallWithSubAgentData(context, get, set, parentToolCallId)
+  },
+
+  // Handle subagent reasoning (same as content for subagent display purposes)
+  reasoning: (data, context, get, set) => {
+    const parentToolCallId = context.subAgentParentToolCallId
+    const phase = data?.phase || data?.data?.phase
+    if (!parentToolCallId) return
+
+    // Initialize if needed
+    if (!context.subAgentContent[parentToolCallId]) {
+      context.subAgentContent[parentToolCallId] = ''
+    }
+    if (!context.subAgentBlocks[parentToolCallId]) {
+      context.subAgentBlocks[parentToolCallId] = []
+    }
+
+    // For reasoning, we just append the content (treating start/end as markers)
+    if (phase === 'start' || phase === 'end') return
+
+    const chunk = typeof data?.data === 'string' ? data.data : data?.content || ''
+    if (!chunk) return
+
+    context.subAgentContent[parentToolCallId] += chunk
+
+    // Update or create the last text block in subAgentBlocks
+    const blocks = context.subAgentBlocks[parentToolCallId]
+    const lastBlock = blocks[blocks.length - 1]
+    if (lastBlock && lastBlock.type === 'subagent_text') {
+      lastBlock.content = (lastBlock.content || '') + chunk
+    } else {
+      blocks.push({
+        type: 'subagent_text',
+        content: chunk,
+        timestamp: Date.now(),
+      })
+    }
+
+    updateToolCallWithSubAgentData(context, get, set, parentToolCallId)
+  },
+
+  // Handle subagent tool_generating (tool is being generated)
+  tool_generating: () => {
+    // Tool generating event - no action needed, we'll handle the actual tool_call
+  },
+
+  // Handle subagent tool calls - also execute client tools
+  tool_call: async (data, context, get, set) => {
+    const parentToolCallId = context.subAgentParentToolCallId
+    if (!parentToolCallId) return
+
+    const toolData = data?.data || {}
+    const id: string | undefined = toolData.id || data?.toolCallId
+    const name: string | undefined = toolData.name || data?.toolName
+    if (!id || !name) return
+
+    // Arguments can come in different locations depending on SSE format
+    // Check multiple possible locations
+    let args = toolData.arguments || toolData.input || data?.arguments || data?.input
+
+    // If arguments is a string, try to parse it as JSON
+    if (typeof args === 'string') {
+      try {
+        args = JSON.parse(args)
+      } catch {
+        logger.warn('[SubAgent] Failed to parse arguments string', { args })
+      }
+    }
+
+    logger.info('[SubAgent] tool_call received', {
+      id,
+      name,
+      hasArgs: !!args,
+      argsKeys: args ? Object.keys(args) : [],
+      toolDataKeys: Object.keys(toolData),
+      dataKeys: Object.keys(data || {}),
+    })
+
+    // Initialize if needed
+    if (!context.subAgentToolCalls[parentToolCallId]) {
+      context.subAgentToolCalls[parentToolCallId] = []
+    }
+    if (!context.subAgentBlocks[parentToolCallId]) {
+      context.subAgentBlocks[parentToolCallId] = []
+    }
+
+    // Ensure client tool instance is registered (for execution)
+    ensureClientToolInstance(name, id)
+
+    // Create or update the subagent tool call
+    const existingIndex = context.subAgentToolCalls[parentToolCallId].findIndex(
+      (tc) => tc.id === id
+    )
+    const subAgentToolCall: CopilotToolCall = {
+      id,
+      name,
+      state: ClientToolCallState.pending,
+      ...(args ? { params: args } : {}),
+      display: resolveToolDisplay(name, ClientToolCallState.pending, id, args),
+    }
+
+    if (existingIndex >= 0) {
+      context.subAgentToolCalls[parentToolCallId][existingIndex] = subAgentToolCall
+    } else {
+      context.subAgentToolCalls[parentToolCallId].push(subAgentToolCall)
+
+      // Also add to ordered blocks
+      context.subAgentBlocks[parentToolCallId].push({
+        type: 'subagent_tool_call',
+        toolCall: subAgentToolCall,
+        timestamp: Date.now(),
+      })
+    }
+
+    // Also add to main toolCallsById for proper tool execution
+    const { toolCallsById } = get()
+    const updated = { ...toolCallsById, [id]: subAgentToolCall }
+    set({ toolCallsById: updated })
+
+    updateToolCallWithSubAgentData(context, get, set, parentToolCallId)
+
+    // Execute client tools (same logic as main tool_call handler)
+    try {
+      const def = getTool(name)
+      if (def) {
+        const hasInterrupt =
+          typeof def.hasInterrupt === 'function'
+            ? !!def.hasInterrupt(args || {})
+            : !!def.hasInterrupt
+        if (!hasInterrupt) {
+          // Auto-execute tools without interrupts
+          const ctx = createExecutionContext({ toolCallId: id, toolName: name })
+          try {
+            await def.execute(ctx, args || {})
+          } catch (execErr: any) {
+            logger.error('[SubAgent] Tool execution failed', { id, name, error: execErr?.message })
+          }
+        }
+      } else {
+        // Fallback to class-based tools
+        const instance = getClientTool(id)
+        if (instance) {
+          const hasInterruptDisplays = !!instance.getInterruptDisplays?.()
+          if (!hasInterruptDisplays) {
+            try {
+              await instance.execute(args || {})
+            } catch (execErr: any) {
+              logger.error('[SubAgent] Class tool execution failed', {
+                id,
+                name,
+                error: execErr?.message,
+              })
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      logger.error('[SubAgent] Tool registry/execution error', { id, name, error: e?.message })
+    }
+  },
+
+  // Handle subagent tool results
+  tool_result: (data, context, get, set) => {
+    const parentToolCallId = context.subAgentParentToolCallId
+    if (!parentToolCallId) return
+
+    const toolCallId: string | undefined = data?.toolCallId || data?.data?.id
+    const success: boolean | undefined = data?.success !== false // Default to true if not specified
+    if (!toolCallId) return
+
+    // Initialize if needed
+    if (!context.subAgentToolCalls[parentToolCallId]) return
+    if (!context.subAgentBlocks[parentToolCallId]) return
+
+    // Update the subagent tool call state
+    const targetState = success ? ClientToolCallState.success : ClientToolCallState.error
+    const existingIndex = context.subAgentToolCalls[parentToolCallId].findIndex(
+      (tc) => tc.id === toolCallId
+    )
+
+    if (existingIndex >= 0) {
+      const existing = context.subAgentToolCalls[parentToolCallId][existingIndex]
+      const updatedSubAgentToolCall = {
+        ...existing,
+        state: targetState,
+        display: resolveToolDisplay(existing.name, targetState, toolCallId, existing.params),
+      }
+      context.subAgentToolCalls[parentToolCallId][existingIndex] = updatedSubAgentToolCall
+
+      // Also update in ordered blocks
+      for (const block of context.subAgentBlocks[parentToolCallId]) {
+        if (block.type === 'subagent_tool_call' && block.toolCall?.id === toolCallId) {
+          block.toolCall = updatedSubAgentToolCall
+          break
+        }
+      }
+
+      // Update the individual tool call in toolCallsById so ToolCall component gets latest state
+      const { toolCallsById } = get()
+      if (toolCallsById[toolCallId]) {
+        const updatedMap = {
+          ...toolCallsById,
+          [toolCallId]: updatedSubAgentToolCall,
+        }
+        set({ toolCallsById: updatedMap })
+        logger.info('[SubAgent] Updated subagent tool call state in toolCallsById', {
+          toolCallId,
+          name: existing.name,
+          state: targetState,
+        })
+      }
+    }
+
+    updateToolCallWithSubAgentData(context, get, set, parentToolCallId)
+  },
+
+  // Handle subagent stream done - just update the streaming state
+  done: (data, context, get, set) => {
+    const parentToolCallId = context.subAgentParentToolCallId
+    if (!parentToolCallId) return
+
+    // Update the tool call with final content but keep streaming true until subagent_end
+    updateToolCallWithSubAgentData(context, get, set, parentToolCallId)
+  },
+}
+
+// Debounced UI update queue for smoother streaming
+const streamingUpdateQueue = new Map<string, StreamingContext>()
+let streamingUpdateRAF: number | null = null
+let lastBatchTime = 0
+const MIN_BATCH_INTERVAL = 16
+const MAX_BATCH_INTERVAL = 50
+const MAX_QUEUE_SIZE = 5
+
+function createOptimizedContentBlocks(contentBlocks: any[]): any[] {
+  const result: any[] = new Array(contentBlocks.length)
+  for (let i = 0; i < contentBlocks.length; i++) {
+    const block = contentBlocks[i]
+    result[i] = { ...block }
+  }
+  return result
+}
+
+function updateStreamingMessage(set: any, context: StreamingContext) {
+  const now = performance.now()
+  streamingUpdateQueue.set(context.messageId, context)
+  const timeSinceLastBatch = now - lastBatchTime
+  const shouldFlushImmediately =
+    streamingUpdateQueue.size >= MAX_QUEUE_SIZE || timeSinceLastBatch > MAX_BATCH_INTERVAL
+
+  if (streamingUpdateRAF === null) {
+    const scheduleUpdate = () => {
+      streamingUpdateRAF = requestAnimationFrame(() => {
+        const updates = new Map(streamingUpdateQueue)
+        streamingUpdateQueue.clear()
+        streamingUpdateRAF = null
+        lastBatchTime = performance.now()
+        set((state: CopilotStore) => {
+          if (updates.size === 0) return state
+          const messages = state.messages
+          const lastMessage = messages[messages.length - 1]
+          const lastMessageUpdate = lastMessage ? updates.get(lastMessage.id) : null
+          if (updates.size === 1 && lastMessageUpdate) {
+            const newMessages = [...messages]
+            newMessages[messages.length - 1] = {
+              ...lastMessage,
+              content: '',
+              contentBlocks:
+                lastMessageUpdate.contentBlocks.length > 0
+                  ? createOptimizedContentBlocks(lastMessageUpdate.contentBlocks)
+                  : [],
+            }
+            return { messages: newMessages }
+          }
+          return {
+            messages: messages.map((msg) => {
+              const update = updates.get(msg.id)
+              if (update) {
+                return {
+                  ...msg,
+                  content: '',
+                  contentBlocks:
+                    update.contentBlocks.length > 0
+                      ? createOptimizedContentBlocks(update.contentBlocks)
+                      : [],
+                }
+              }
+              return msg
+            }),
+          }
+        })
+      })
+    }
+    if (shouldFlushImmediately) scheduleUpdate()
+    else setTimeout(scheduleUpdate, Math.max(0, MIN_BATCH_INTERVAL - timeSinceLastBatch))
+  }
+}
+
+async function* parseSSEStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  decoder: TextDecoder
+) {
+  let buffer = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    const chunk = decoder.decode(value, { stream: true })
+    buffer += chunk
+    const lastNewlineIndex = buffer.lastIndexOf('\n')
+    if (lastNewlineIndex !== -1) {
+      const linesToProcess = buffer.substring(0, lastNewlineIndex)
+      buffer = buffer.substring(lastNewlineIndex + 1)
+      const lines = linesToProcess.split('\n')
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]
+        if (line.length === 0) continue
+        if (line.charCodeAt(0) === 100 && line.startsWith(DATA_PREFIX)) {
+          try {
+            const jsonStr = line.substring(DATA_PREFIX_LENGTH)
+            yield JSON.parse(jsonStr)
+          } catch (error) {
+            logger.warn('Failed to parse SSE data:', error)
+          }
+        }
+      }
+    }
+  }
+}
+
+// Initial state (subset required for UI/streaming)
+const initialState = {
+  mode: 'build' as const,
+  selectedModel: 'claude-4.5-opus' as CopilotStore['selectedModel'],
+  agentPrefetch: false,
+  enabledModels: null as string[] | null, // Null means not loaded yet, empty array means all disabled
+  isCollapsed: false,
+  currentChat: null as CopilotChat | null,
+  chats: [] as CopilotChat[],
+  messages: [] as CopilotMessage[],
+  checkpoints: [] as any[],
+  messageCheckpoints: {} as Record<string, any[]>,
+  isLoading: false,
+  isLoadingChats: false,
+  isLoadingCheckpoints: false,
+  isSendingMessage: false,
+  isSaving: false,
+  isRevertingCheckpoint: false,
+  isAborting: false,
+  error: null as string | null,
+  saveError: null as string | null,
+  checkpointError: null as string | null,
+  workflowId: null as string | null,
+  abortController: null as AbortController | null,
+  chatsLastLoadedAt: null as Date | null,
+  chatsLoadedForWorkflow: null as string | null,
+  revertState: null as { messageId: string; messageContent: string } | null,
+  inputValue: '',
+  planTodos: [] as Array<{ id: string; content: string; completed?: boolean; executing?: boolean }>,
+  showPlanTodos: false,
+  streamingPlanContent: '',
+  toolCallsById: {} as Record<string, CopilotToolCall>,
+  suppressAutoSelect: false,
+  autoAllowedTools: [] as string[],
+  messageQueue: [] as import('./types').QueuedMessage[],
+}
+
+export const useCopilotStore = create<CopilotStore>()(
+  devtools((set, get) => ({
+    ...initialState,
+
+    // Basic mode controls
+    setMode: (mode) => set({ mode }),
+
+    // Clear messages (don't clear streamingPlanContent - let it persist)
+    clearMessages: () => set({ messages: [] }),
+
+    // Workflow selection
+    setWorkflowId: async (workflowId: string | null) => {
+      const currentWorkflowId = get().workflowId
+      if (currentWorkflowId === workflowId) return
+      const { isSendingMessage } = get()
+      if (isSendingMessage) get().abortMessage()
+
+      // Abort all in-progress tools and clear any diff preview
+      abortAllInProgressTools(set, get)
+      try {
+        useWorkflowDiffStore.getState().clearDiff()
+      } catch {}
+
+      set({
+        ...initialState,
+        workflowId,
+        mode: get().mode,
+        selectedModel: get().selectedModel,
+        agentPrefetch: get().agentPrefetch,
+      })
+    },
+
+    // Chats (minimal implementation for visibility)
+    validateCurrentChat: () => {
+      const { currentChat, workflowId, chats } = get()
+      if (!currentChat || !workflowId) return false
+      const chatExists = chats.some((c) => c.id === currentChat.id)
+      if (!chatExists) {
+        set({ currentChat: null, messages: [] })
+        return false
+      }
+      return true
+    },
+
+    selectChat: async (chat: CopilotChat) => {
+      const { isSendingMessage, currentChat, workflowId } = get()
+      if (!workflowId) {
+        return
+      }
+      if (currentChat && currentChat.id !== chat.id && isSendingMessage) get().abortMessage()
+
+      // Abort in-progress tools and clear diff when changing chats
+      abortAllInProgressTools(set, get)
+      try {
+        useWorkflowDiffStore.getState().clearDiff()
+      } catch {}
+
+      // Restore plan content and config (mode/model) from selected chat
+      const planArtifact = chat.planArtifact || ''
+      const chatConfig = chat.config || {}
+      const chatMode = chatConfig.mode || get().mode
+      const chatModel = chatConfig.model || get().selectedModel
+
+      logger.info('[Chat] Restoring chat config', {
+        chatId: chat.id,
+        mode: chatMode,
+        model: chatModel,
+        hasPlanArtifact: !!planArtifact,
+      })
+
+      // Capture previous chat/messages for optimistic background save
+      const previousChat = currentChat
+      const previousMessages = get().messages
+      const previousMode = get().mode
+      const previousModel = get().selectedModel
+
+      // Optimistically set selected chat and normalize messages for UI
+      const normalizedMessages = normalizeMessagesForUI(chat.messages || [])
+      const toolCallsById = buildToolCallsById(normalizedMessages)
+
+      set({
+        currentChat: chat,
+        messages: normalizedMessages,
+        toolCallsById,
+        planTodos: [],
+        showPlanTodos: false,
+        streamingPlanContent: planArtifact,
+        mode: chatMode,
+        selectedModel: chatModel as CopilotStore['selectedModel'],
+        suppressAutoSelect: false,
+      })
+
+      // Background-save the previous chat's latest messages, plan artifact, and config before switching (optimistic)
+      try {
+        if (previousChat && previousChat.id !== chat.id) {
+          const dbMessages = validateMessagesForLLM(previousMessages)
+          const previousPlanArtifact = get().streamingPlanContent
+          fetch('/api/copilot/chat/update-messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chatId: previousChat.id,
+              messages: dbMessages,
+              planArtifact: previousPlanArtifact || null,
+              config: {
+                mode: previousMode,
+                model: previousModel,
+              },
+            }),
+          }).catch(() => {})
+        }
+      } catch {}
+
+      // Refresh selected chat from server to ensure we have latest messages/tool calls
+      try {
+        const response = await fetch(`/api/copilot/chat?workflowId=${workflowId}`)
+        if (!response.ok) throw new Error(`Failed to fetch latest chat data: ${response.status}`)
+        const data = await response.json()
+        if (data.success && Array.isArray(data.chats)) {
+          const latestChat = data.chats.find((c: CopilotChat) => c.id === chat.id)
+          if (latestChat) {
+            const normalizedMessages = normalizeMessagesForUI(latestChat.messages || [])
+            const toolCallsById = buildToolCallsById(normalizedMessages)
+
+            set({
+              currentChat: latestChat,
+              messages: normalizedMessages,
+              chats: (get().chats || []).map((c: CopilotChat) =>
+                c.id === chat.id ? latestChat : c
+              ),
+              toolCallsById,
+            })
+            try {
+              await get().loadMessageCheckpoints(latestChat.id)
+            } catch {}
+          }
+        }
+      } catch {}
+    },
+
+    createNewChat: async () => {
+      const { isSendingMessage } = get()
+      if (isSendingMessage) get().abortMessage()
+
+      // Abort in-progress tools and clear diff on new chat
+      abortAllInProgressTools(set, get)
+      try {
+        useWorkflowDiffStore.getState().clearDiff()
+      } catch {}
+
+      // Background-save the current chat before clearing (optimistic)
+      try {
+        const { currentChat, streamingPlanContent, mode, selectedModel } = get()
+        if (currentChat) {
+          const currentMessages = get().messages
+          const dbMessages = validateMessagesForLLM(currentMessages)
+          fetch('/api/copilot/chat/update-messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chatId: currentChat.id,
+              messages: dbMessages,
+              planArtifact: streamingPlanContent || null,
+              config: {
+                mode,
+                model: selectedModel,
+              },
+            }),
+          }).catch(() => {})
+        }
+      } catch {}
+
+      set({
+        currentChat: null,
+        messages: [],
+        messageCheckpoints: {},
+        planTodos: [],
+        showPlanTodos: false,
+        streamingPlanContent: '',
+        suppressAutoSelect: true,
+      })
+    },
+
+    deleteChat: async (chatId: string) => {
+      try {
+        // Call delete API
+        const response = await fetch('/api/copilot/chat/delete', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chatId }),
+        })
+
+        if (!response.ok) {
+          throw new Error(`Failed to delete chat: ${response.status}`)
+        }
+
+        // Remove from local state
+        set((state) => ({
+          chats: state.chats.filter((c) => c.id !== chatId),
+          // If deleted chat was current, clear it
+          currentChat: state.currentChat?.id === chatId ? null : state.currentChat,
+          messages: state.currentChat?.id === chatId ? [] : state.messages,
+        }))
+
+        logger.info('Chat deleted', { chatId })
+      } catch (error) {
+        logger.error('Failed to delete chat:', error)
+        throw error
+      }
+    },
+
+    areChatsFresh: (_workflowId: string) => false,
+
+    loadChats: async (_forceRefresh = false) => {
+      const { workflowId } = get()
+
+      if (!workflowId) {
+        set({ chats: [], isLoadingChats: false })
+        return
+      }
+
+      // For now always fetch fresh
+      set({ isLoadingChats: true })
+      try {
+        const url = `/api/copilot/chat?workflowId=${workflowId}`
+        const response = await fetch(url)
+        if (!response.ok) {
+          throw new Error(`Failed to fetch chats: ${response.status}`)
+        }
+        const data = await response.json()
+        if (data.success && Array.isArray(data.chats)) {
+          const now = new Date()
+          set({
+            chats: data.chats,
+            isLoadingChats: false,
+            chatsLastLoadedAt: now,
+            chatsLoadedForWorkflow: workflowId,
+          })
+
+          if (data.chats.length > 0) {
+            const { currentChat, isSendingMessage, suppressAutoSelect } = get()
+            const currentChatStillExists =
+              currentChat && data.chats.some((c: CopilotChat) => c.id === currentChat.id)
+
+            if (currentChatStillExists) {
+              const updatedCurrentChat = data.chats.find(
+                (c: CopilotChat) => c.id === currentChat!.id
+              )!
+              if (isSendingMessage) {
+                set({ currentChat: { ...updatedCurrentChat, messages: get().messages } })
+              } else {
+                const normalizedMessages = normalizeMessagesForUI(updatedCurrentChat.messages || [])
+
+                // Restore plan artifact and config from refreshed chat
+                const refreshedPlanArtifact = updatedCurrentChat.planArtifact || ''
+                const refreshedConfig = updatedCurrentChat.config || {}
+                const refreshedMode = refreshedConfig.mode || get().mode
+                const refreshedModel = refreshedConfig.model || get().selectedModel
+                const toolCallsById = buildToolCallsById(normalizedMessages)
+
+                set({
+                  currentChat: updatedCurrentChat,
+                  messages: normalizedMessages,
+                  toolCallsById,
+                  streamingPlanContent: refreshedPlanArtifact,
+                  mode: refreshedMode,
+                  selectedModel: refreshedModel as CopilotStore['selectedModel'],
+                })
+              }
+              try {
+                await get().loadMessageCheckpoints(updatedCurrentChat.id)
+              } catch {}
+            } else if (!isSendingMessage && !suppressAutoSelect) {
+              const mostRecentChat: CopilotChat = data.chats[0]
+              const normalizedMessages = normalizeMessagesForUI(mostRecentChat.messages || [])
+
+              // Restore plan artifact and config from most recent chat
+              const planArtifact = mostRecentChat.planArtifact || ''
+              const chatConfig = mostRecentChat.config || {}
+              const chatMode = chatConfig.mode || get().mode
+              const chatModel = chatConfig.model || get().selectedModel
+
+              logger.info('[Chat] Auto-selecting most recent chat with config', {
+                chatId: mostRecentChat.id,
+                mode: chatMode,
+                model: chatModel,
+                hasPlanArtifact: !!planArtifact,
+              })
+
+              const toolCallsById = buildToolCallsById(normalizedMessages)
+
+              set({
+                currentChat: mostRecentChat,
+                messages: normalizedMessages,
+                toolCallsById,
+                streamingPlanContent: planArtifact,
+                mode: chatMode,
+                selectedModel: chatModel as CopilotStore['selectedModel'],
+              })
+              try {
+                await get().loadMessageCheckpoints(mostRecentChat.id)
+              } catch {}
+            }
+          } else {
+            set({ currentChat: null, messages: [] })
+          }
+        } else {
+          throw new Error('Invalid response format')
+        }
+      } catch (error) {
+        set({
+          chats: [],
+          isLoadingChats: false,
+          error: error instanceof Error ? error.message : 'Failed to load chats',
+        })
+      }
+    },
+
+    // Send a message (streaming only)
+    sendMessage: async (message: string, options = {}) => {
+      const { workflowId, currentChat, mode, revertState, isSendingMessage } = get()
+      const {
+        stream = true,
+        fileAttachments,
+        contexts,
+        messageId,
+      } = options as {
+        stream?: boolean
+        fileAttachments?: MessageFileAttachment[]
+        contexts?: ChatContext[]
+        messageId?: string
+      }
+
+      if (!workflowId) return
+
+      // If already sending a message, queue this one instead
+      if (isSendingMessage) {
+        get().addToQueue(message, { fileAttachments, contexts })
+        logger.info('[Copilot] Message queued (already sending)', {
+          queueLength: get().messageQueue.length + 1,
+        })
+        return
+      }
+
+      const abortController = new AbortController()
+      set({ isSendingMessage: true, error: null, abortController })
+
+      const userMessage = createUserMessage(message, fileAttachments, contexts, messageId)
+      const streamingMessage = createStreamingMessage()
+
+      let newMessages: CopilotMessage[]
+      if (revertState) {
+        const currentMessages = get().messages
+        newMessages = [...currentMessages, userMessage, streamingMessage]
+        set({ revertState: null, inputValue: '' })
+      } else {
+        const currentMessages = get().messages
+        // If messageId is provided, check if it already exists (e.g., from edit flow)
+        const existingIndex = messageId ? currentMessages.findIndex((m) => m.id === messageId) : -1
+        if (existingIndex !== -1) {
+          // Replace existing message instead of adding new one
+          newMessages = [...currentMessages.slice(0, existingIndex), userMessage, streamingMessage]
+        } else {
+          // Add new messages normally
+          newMessages = [...currentMessages, userMessage, streamingMessage]
+        }
+      }
+
+      const isFirstMessage = get().messages.length === 0 && !currentChat?.title
+      set((state) => ({
+        messages: newMessages,
+        currentUserMessageId: userMessage.id,
+      }))
+
+      if (isFirstMessage) {
+        const optimisticTitle = message.length > 50 ? `${message.substring(0, 47)}...` : message
+        set((state) => ({
+          currentChat: state.currentChat
+            ? { ...state.currentChat, title: optimisticTitle }
+            : state.currentChat,
+        }))
+      }
+
+      try {
+        // Debug: log contexts presence before sending
+        try {
+          logger.info('sendMessage: preparing request', {
+            hasContexts: Array.isArray(contexts),
+            contextsCount: Array.isArray(contexts) ? contexts.length : 0,
+            contextsPreview: Array.isArray(contexts)
+              ? contexts.map((c: any) => ({
+                  kind: c?.kind,
+                  chatId: (c as any)?.chatId,
+                  workflowId: (c as any)?.workflowId,
+                  label: (c as any)?.label,
+                }))
+              : undefined,
+          })
+        } catch {}
+
+        // Prepend design document to message if available
+        const { streamingPlanContent } = get()
+        let messageToSend = message
+        if (streamingPlanContent?.trim()) {
+          messageToSend = `Design Document:\n\n${streamingPlanContent}\n\n==============\n\nUser Query:\n\n${message}`
+          logger.info('[DesignDocument] Prepending plan content to message', {
+            planLength: streamingPlanContent.length,
+            originalMessageLength: message.length,
+            finalMessageLength: messageToSend.length,
+          })
+        }
+
+        // Call copilot API
+        const apiMode: 'ask' | 'agent' | 'plan' =
+          mode === 'ask' ? 'ask' : mode === 'plan' ? 'plan' : 'agent'
+        const result = await sendStreamingMessage({
+          message: messageToSend,
+          userMessageId: userMessage.id,
+          chatId: currentChat?.id,
+          workflowId: workflowId || undefined,
+          mode: apiMode,
+          model: get().selectedModel,
+          prefetch: get().agentPrefetch,
+          createNewChat: !currentChat,
+          stream,
+          fileAttachments,
+          contexts,
+          abortSignal: abortController.signal,
+        })
+
+        if (result.success && result.stream) {
+          await get().handleStreamingResponse(
+            result.stream,
+            streamingMessage.id,
+            false,
+            userMessage.id
+          )
+          set({ chatsLastLoadedAt: null, chatsLoadedForWorkflow: null })
+        } else {
+          if (result.error === 'Request was aborted') {
+            return
+          }
+
+          // Check for specific status codes and provide custom messages
+          let errorContent = result.error || 'Failed to send message'
+          let errorType:
+            | 'usage_limit'
+            | 'unauthorized'
+            | 'forbidden'
+            | 'rate_limit'
+            | 'upgrade_required'
+            | undefined
+          if (result.status === 401) {
+            errorContent =
+              '_Unauthorized request. You need a valid API key to use the copilot. You can get one by going to [sim.ai](https://sim.ai) settings and generating one there._'
+            errorType = 'unauthorized'
+          } else if (result.status === 402) {
+            errorContent =
+              '_Usage limit exceeded. To continue using this service, upgrade your plan or increase your usage limit to:_'
+            errorType = 'usage_limit'
+          } else if (result.status === 403) {
+            errorContent =
+              '_Provider config not allowed for non-enterprise users. Please remove the provider config and try again_'
+            errorType = 'forbidden'
+          } else if (result.status === 426) {
+            errorContent =
+              '_Please upgrade to the latest version of the Sim platform to continue using the copilot._'
+            errorType = 'upgrade_required'
+          } else if (result.status === 429) {
+            errorContent = '_Provider rate limit exceeded. Please try again later._'
+            errorType = 'rate_limit'
+          }
+
+          const errorMessage = createErrorMessage(streamingMessage.id, errorContent, errorType)
+          set((state) => ({
+            messages: state.messages.map((m) => (m.id === streamingMessage.id ? errorMessage : m)),
+            error: errorContent,
+            isSendingMessage: false,
+            abortController: null,
+          }))
+        }
+      } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') return
+        const errorMessage = createErrorMessage(
+          streamingMessage.id,
+          'Sorry, I encountered an error while processing your message. Please try again.'
+        )
+        set((state) => ({
+          messages: state.messages.map((m) => (m.id === streamingMessage.id ? errorMessage : m)),
+          error: error instanceof Error ? error.message : 'Failed to send message',
+          isSendingMessage: false,
+          abortController: null,
+        }))
+      }
+    },
+
+    // Abort streaming
+    abortMessage: () => {
+      const { abortController, isSendingMessage, messages } = get()
+      if (!isSendingMessage || !abortController) return
+      set({ isAborting: true })
+      try {
+        abortController.abort()
+        const lastMessage = messages[messages.length - 1]
+        if (lastMessage && lastMessage.role === 'assistant') {
+          const textContent =
+            lastMessage.contentBlocks
+              ?.filter((b) => b.type === 'text')
+              .map((b: any) => b.content)
+              .join('') || ''
+          set((state) => ({
+            messages: state.messages.map((msg) =>
+              msg.id === lastMessage.id
+                ? { ...msg, content: textContent.trim() || 'Message was aborted' }
+                : msg
+            ),
+            isSendingMessage: false,
+            isAborting: false,
+            abortController: null,
+          }))
+        } else {
+          set({
+            isSendingMessage: false,
+            isAborting: false,
+            abortController: null,
+          })
+        }
+
+        // Immediately put all in-progress tools into aborted state
+        abortAllInProgressTools(set, get)
+
+        // Persist whatever contentBlocks/text we have to keep ordering for reloads
+        const { currentChat, streamingPlanContent, mode, selectedModel } = get()
+        if (currentChat) {
+          try {
+            const currentMessages = get().messages
+            const dbMessages = validateMessagesForLLM(currentMessages)
+            fetch('/api/copilot/chat/update-messages', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chatId: currentChat.id,
+                messages: dbMessages,
+                planArtifact: streamingPlanContent || null,
+                config: {
+                  mode,
+                  model: selectedModel,
+                },
+              }),
+            }).catch(() => {})
+          } catch {}
+        }
+      } catch {
+        set({ isSendingMessage: false, isAborting: false, abortController: null })
+      }
+    },
+
+    // Implicit feedback (send a continuation) - minimal
+    sendImplicitFeedback: async (implicitFeedback: string) => {
+      const { workflowId, currentChat, mode, selectedModel } = get()
+      if (!workflowId) return
+      const abortController = new AbortController()
+      set({ isSendingMessage: true, error: null, abortController })
+      const newAssistantMessage = createStreamingMessage()
+      set((state) => ({ messages: [...state.messages, newAssistantMessage] }))
+      try {
+        const apiMode: 'ask' | 'agent' | 'plan' =
+          mode === 'ask' ? 'ask' : mode === 'plan' ? 'plan' : 'agent'
+        const result = await sendStreamingMessage({
+          message: 'Please continue your response.',
+          chatId: currentChat?.id,
+          workflowId,
+          mode: apiMode,
+          model: selectedModel,
+          prefetch: get().agentPrefetch,
+          createNewChat: !currentChat,
+          stream: true,
+          implicitFeedback,
+          abortSignal: abortController.signal,
+        })
+        if (result.success && result.stream) {
+          await get().handleStreamingResponse(result.stream, newAssistantMessage.id, false)
+        } else {
+          if (result.error === 'Request was aborted') return
+          const errorMessage = createErrorMessage(
+            newAssistantMessage.id,
+            result.error || 'Failed to send implicit feedback'
+          )
+          set((state) => ({
+            messages: state.messages.map((msg) =>
+              msg.id === newAssistantMessage.id ? errorMessage : msg
+            ),
+            error: result.error || 'Failed to send implicit feedback',
+            isSendingMessage: false,
+            abortController: null,
+          }))
+        }
+      } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') return
+        const errorMessage = createErrorMessage(
+          newAssistantMessage.id,
+          'Sorry, I encountered an error while processing your feedback. Please try again.'
+        )
+        set((state) => ({
+          messages: state.messages.map((msg) =>
+            msg.id === newAssistantMessage.id ? errorMessage : msg
+          ),
+          error: error instanceof Error ? error.message : 'Failed to send implicit feedback',
+          isSendingMessage: false,
+          abortController: null,
+        }))
+      }
+    },
+
+    // Tool-call related APIs are stubbed for now
+    setToolCallState: (toolCall: any, newState: any) => {
+      try {
+        const id: string | undefined = toolCall?.id
+        if (!id) return
+        const map = { ...get().toolCallsById }
+        const current = map[id]
+        if (!current) return
+        // Preserve rejected state from being overridden
+        if (
+          isRejectedState(current.state) &&
+          (newState === 'success' || newState === (ClientToolCallState as any).success)
+        ) {
+          return
+        }
+        let norm: ClientToolCallState = current.state
+        if (newState === 'executing') norm = ClientToolCallState.executing
+        else if (newState === 'errored' || newState === 'error') norm = ClientToolCallState.error
+        else if (newState === 'rejected') norm = ClientToolCallState.rejected
+        else if (newState === 'pending') norm = ClientToolCallState.pending
+        else if (newState === 'success' || newState === 'accepted')
+          norm = ClientToolCallState.success
+        else if (newState === 'aborted') norm = ClientToolCallState.aborted
+        else if (typeof newState === 'number') norm = newState as unknown as ClientToolCallState
+        map[id] = {
+          ...current,
+          state: norm,
+          display: resolveToolDisplay(current.name, norm, id, current.params),
+        }
+        set({ toolCallsById: map })
+      } catch {}
+    },
+
+    updateToolCallParams: (toolCallId: string, params: Record<string, any>) => {
+      try {
+        if (!toolCallId) return
+        const map = { ...get().toolCallsById }
+        const current = map[toolCallId]
+        if (!current) return
+        const updatedParams = { ...current.params, ...params }
+        map[toolCallId] = {
+          ...current,
+          params: updatedParams,
+          display: resolveToolDisplay(current.name, current.state, toolCallId, updatedParams),
+        }
+        set({ toolCallsById: map })
+      } catch {}
+    },
+    updatePreviewToolCallState: (
+      toolCallState: 'accepted' | 'rejected' | 'error',
+      toolCallId?: string
+    ) => {
+      const stateMap: Record<string, ClientToolCallState> = {
+        accepted: ClientToolCallState.success,
+        rejected: ClientToolCallState.rejected,
+        error: ClientToolCallState.error,
+      }
+      const targetState = stateMap[toolCallState] || ClientToolCallState.success
+      const { toolCallsById } = get()
+      // Determine target tool
+      let id = toolCallId
+      if (!id) {
+        // Prefer the latest assistant message's build/edit tool_call
+        const messages = get().messages
+        outer: for (let mi = messages.length - 1; mi >= 0; mi--) {
+          const m = messages[mi]
+          if (m.role !== 'assistant' || !m.contentBlocks) continue
+          const blocks = m.contentBlocks as any[]
+          for (let bi = blocks.length - 1; bi >= 0; bi--) {
+            const b = blocks[bi]
+            if (b?.type === 'tool_call') {
+              const tn = b.toolCall?.name
+              if (tn === 'edit_workflow') {
+                id = b.toolCall?.id
+                break outer
+              }
+            }
+          }
+        }
+        // Fallback to map if not found in messages
+        if (!id) {
+          const candidates = Object.values(toolCallsById).filter((t) => t.name === 'edit_workflow')
+          id = candidates.length ? candidates[candidates.length - 1].id : undefined
+        }
+      }
+      if (!id) return
+      const current = toolCallsById[id]
+      if (!current) return
+      // Do not override a rejected tool with success
+      if (isRejectedState(current.state) && targetState === (ClientToolCallState as any).success) {
+        return
+      }
+
+      // Update store map
+      const updatedMap = { ...toolCallsById }
+      const updatedDisplay = resolveToolDisplay(current.name, targetState, id, current.params)
+      updatedMap[id] = {
+        ...current,
+        state: targetState,
+        display: updatedDisplay,
+      }
+      set({ toolCallsById: updatedMap })
+
+      // Update inline content block in the latest assistant message
+      set((s) => {
+        const messages = [...s.messages]
+        for (let mi = messages.length - 1; mi >= 0; mi--) {
+          const m = messages[mi]
+          if (m.role !== 'assistant' || !m.contentBlocks) continue
+          let changed = false
+          const blocks = m.contentBlocks.map((b: any) => {
+            if (b.type === 'tool_call' && b.toolCall?.id === id) {
+              changed = true
+              const prev = b.toolCall || {}
+              return {
+                ...b,
+                toolCall: {
+                  ...prev,
+                  id,
+                  name: current.name,
+                  state: targetState,
+                  display: updatedDisplay,
+                  params: current.params,
+                },
+              }
+            }
+            return b
+          })
+          if (changed) {
+            messages[mi] = { ...m, contentBlocks: blocks }
+            break
+          }
+        }
+        return { messages }
+      })
+
+      // Notify backend mark-complete to finalize tool server-side
+      try {
+        fetch('/api/copilot/tools/mark-complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id,
+            name: current.name,
+            status:
+              targetState === ClientToolCallState.success
+                ? 200
+                : targetState === ClientToolCallState.rejected
+                  ? 409
+                  : 500,
+            message: toolCallState,
+          }),
+        }).catch(() => {})
+      } catch {}
+    },
+
+    sendDocsMessage: async (query: string) => {
+      await get().sendMessage(query)
+    },
+
+    saveChatMessages: async (_chatId: string) => {},
+
+    loadCheckpoints: async (_chatId: string) => set({ checkpoints: [] }),
+
+    loadMessageCheckpoints: async (chatId: string) => {
+      const { workflowId } = get()
+      if (!workflowId) return
+      set({ isLoadingCheckpoints: true, checkpointError: null })
+      try {
+        const response = await fetch(`/api/copilot/checkpoints?chatId=${chatId}`)
+        if (!response.ok) throw new Error(`Failed to load checkpoints: ${response.statusText}`)
+        const data = await response.json()
+        if (data.success && Array.isArray(data.checkpoints)) {
+          const grouped = data.checkpoints.reduce((acc: Record<string, any[]>, cp: any) => {
+            const key = cp.messageId || '__no_message__'
+            acc[key] = acc[key] || []
+            acc[key].push(cp)
+            return acc
+          }, {})
+          set({ messageCheckpoints: grouped, isLoadingCheckpoints: false })
+        } else {
+          throw new Error('Invalid checkpoints response')
+        }
+      } catch (error) {
+        set({
+          isLoadingCheckpoints: false,
+          checkpointError: error instanceof Error ? error.message : 'Failed to load checkpoints',
+        })
+      }
+    },
+
+    // Revert to a specific checkpoint and apply state locally
+    revertToCheckpoint: async (checkpointId: string) => {
+      const { workflowId } = get()
+      if (!workflowId) return
+      set({ isRevertingCheckpoint: true, checkpointError: null })
+      try {
+        const response = await fetch('/api/copilot/checkpoints/revert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ checkpointId }),
+        })
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => '')
+          throw new Error(errorText || `Failed to revert: ${response.statusText}`)
+        }
+        const result = await response.json()
+        const reverted = result?.checkpoint?.workflowState || null
+        if (reverted) {
+          // Clear any active diff preview
+          try {
+            useWorkflowDiffStore.getState().clearDiff()
+          } catch {}
+
+          // Apply to main workflow store
+          useWorkflowStore.setState({
+            blocks: reverted.blocks || {},
+            edges: reverted.edges || [],
+            loops: reverted.loops || {},
+            parallels: reverted.parallels || {},
+            lastSaved: reverted.lastSaved || Date.now(),
+            deploymentStatuses: reverted.deploymentStatuses || {},
+          })
+
+          // Extract and apply subblock values
+          const values: Record<string, Record<string, any>> = {}
+          Object.entries(reverted.blocks || {}).forEach(([blockId, block]: [string, any]) => {
+            values[blockId] = {}
+            Object.entries((block as any).subBlocks || {}).forEach(
+              ([subId, sub]: [string, any]) => {
+                values[blockId][subId] = (sub as any)?.value
+              }
+            )
+          })
+          const subState = useSubBlockStore.getState()
+          useSubBlockStore.setState({
+            workflowValues: {
+              ...subState.workflowValues,
+              [workflowId]: values,
+            },
+          })
+        }
+        set({ isRevertingCheckpoint: false })
+      } catch (error) {
+        set({
+          isRevertingCheckpoint: false,
+          checkpointError: error instanceof Error ? error.message : 'Failed to revert checkpoint',
+        })
+        throw error
+      }
+    },
+    getCheckpointsForMessage: (messageId: string) => {
+      const { messageCheckpoints } = get()
+      return messageCheckpoints[messageId] || []
+    },
+
+    // Handle streaming response
+    handleStreamingResponse: async (
+      stream: ReadableStream,
+      assistantMessageId: string,
+      isContinuation = false,
+      triggerUserMessageId?: string
+    ) => {
+      const reader = stream.getReader()
+      const decoder = new TextDecoder()
+      const startTimeMs = Date.now()
+
+      const context: StreamingContext = {
+        messageId: assistantMessageId,
+        accumulatedContent: new StringBuilder(),
+        contentBlocks: [],
+        currentTextBlock: null,
+        isInThinkingBlock: false,
+        currentThinkingBlock: null,
+        isInDesignWorkflowBlock: false,
+        designWorkflowContent: '',
+        pendingContent: '',
+        doneEventCount: 0,
+        subAgentContent: {},
+        subAgentToolCalls: {},
+        subAgentBlocks: {},
+      }
+
+      if (isContinuation) {
+        const { messages } = get()
+        const existingMessage = messages.find((m) => m.id === assistantMessageId)
+        if (existingMessage) {
+          if (existingMessage.content) context.accumulatedContent.append(existingMessage.content)
+          context.contentBlocks = existingMessage.contentBlocks
+            ? [...existingMessage.contentBlocks]
+            : []
+        }
+      }
+
+      const timeoutId = setTimeout(() => {
+        logger.warn('Stream timeout reached, completing response')
+        reader.cancel()
+      }, 600000)
+
+      try {
+        for await (const data of parseSSEStream(reader, decoder)) {
+          const { abortController } = get()
+          if (abortController?.signal.aborted) break
+
+          // Log SSE events for debugging
+          logger.info('[SSE] Received event', {
+            type: data.type,
+            hasSubAgent: !!data.subagent,
+            subagent: data.subagent,
+            dataPreview:
+              typeof data.data === 'string'
+                ? data.data.substring(0, 100)
+                : JSON.stringify(data.data)?.substring(0, 100),
+          })
+
+          // Handle subagent_start to track parent tool call
+          if (data.type === 'subagent_start') {
+            const toolCallId = data.data?.tool_call_id
+            if (toolCallId) {
+              context.subAgentParentToolCallId = toolCallId
+              // Mark the parent tool call as streaming
+              const { toolCallsById } = get()
+              const parentToolCall = toolCallsById[toolCallId]
+              if (parentToolCall) {
+                const updatedToolCall: CopilotToolCall = {
+                  ...parentToolCall,
+                  subAgentStreaming: true,
+                }
+                const updatedMap = { ...toolCallsById, [toolCallId]: updatedToolCall }
+                set({ toolCallsById: updatedMap })
+              }
+              logger.info('[SSE] Subagent session started', {
+                subagent: data.subagent,
+                parentToolCallId: toolCallId,
+              })
+            }
+            continue
+          }
+
+          // Handle subagent_end to finalize subagent content
+          if (data.type === 'subagent_end') {
+            const parentToolCallId = context.subAgentParentToolCallId
+            if (parentToolCallId) {
+              // Mark subagent streaming as complete
+              const { toolCallsById } = get()
+              const parentToolCall = toolCallsById[parentToolCallId]
+              if (parentToolCall) {
+                const updatedToolCall: CopilotToolCall = {
+                  ...parentToolCall,
+                  subAgentContent: context.subAgentContent[parentToolCallId] || '',
+                  subAgentToolCalls: context.subAgentToolCalls[parentToolCallId] || [],
+                  subAgentBlocks: context.subAgentBlocks[parentToolCallId] || [],
+                  subAgentStreaming: false, // Done streaming
+                }
+                const updatedMap = { ...toolCallsById, [parentToolCallId]: updatedToolCall }
+                set({ toolCallsById: updatedMap })
+                logger.info('[SSE] Subagent session ended', {
+                  subagent: data.subagent,
+                  parentToolCallId,
+                  contentLength: context.subAgentContent[parentToolCallId]?.length || 0,
+                  toolCallCount: context.subAgentToolCalls[parentToolCallId]?.length || 0,
+                })
+              }
+            }
+            context.subAgentParentToolCallId = undefined
+            continue
+          }
+
+          // Check if this is a subagent event (has subagent field)
+          if (data.subagent) {
+            const parentToolCallId = context.subAgentParentToolCallId
+            if (!parentToolCallId) {
+              logger.warn('[SSE] Subagent event without parent tool call ID', {
+                type: data.type,
+                subagent: data.subagent,
+              })
+              continue
+            }
+
+            logger.info('[SSE] Processing subagent event', {
+              type: data.type,
+              subagent: data.subagent,
+              parentToolCallId,
+              hasHandler: !!subAgentSSEHandlers[data.type],
+            })
+
+            const subAgentHandler = subAgentSSEHandlers[data.type]
+            if (subAgentHandler) {
+              await subAgentHandler(data, context, get, set)
+            } else {
+              logger.warn('[SSE] No handler for subagent event type', { type: data.type })
+            }
+            // Skip regular handlers for subagent events
+            if (context.streamComplete) break
+            continue
+          }
+
+          const handler = sseHandlers[data.type] || sseHandlers.default
+          await handler(data, context, get, set)
+          if (context.streamComplete) break
+        }
+
+        if (sseHandlers.stream_end) sseHandlers.stream_end({}, context, get, set)
+
+        if (streamingUpdateRAF !== null) {
+          cancelAnimationFrame(streamingUpdateRAF)
+          streamingUpdateRAF = null
+        }
+        streamingUpdateQueue.clear()
+
+        let sanitizedContentBlocks: any[] = []
+        if (context.contentBlocks && context.contentBlocks.length > 0) {
+          const optimizedBlocks = createOptimizedContentBlocks(context.contentBlocks)
+          sanitizedContentBlocks = optimizedBlocks.map((block: any) =>
+            block.type === TEXT_BLOCK_TYPE && typeof block.content === 'string'
+              ? { ...block, content: stripTodoTags(block.content) }
+              : block
+          )
+        }
+
+        if (context.contentBlocks) {
+          context.contentBlocks.forEach((block) => {
+            if (block.type === TEXT_BLOCK_TYPE || block.type === THINKING_BLOCK_TYPE) {
+              contentBlockPool.release(block)
+            }
+          })
+        }
+
+        const finalContent = stripTodoTags(context.accumulatedContent.toString())
+        set((state) => ({
+          messages: state.messages.map((msg) =>
+            msg.id === assistantMessageId
+              ? {
+                  ...msg,
+                  content: finalContent,
+                  contentBlocks: sanitizedContentBlocks,
+                }
+              : msg
+          ),
+          isSendingMessage: false,
+          abortController: null,
+          currentUserMessageId: null,
+        }))
+
+        if (context.newChatId && !get().currentChat) {
+          await get().handleNewChatCreation(context.newChatId)
+        }
+
+        // Process next message in queue if any
+        const nextInQueue = get().messageQueue[0]
+        if (nextInQueue) {
+          logger.info('[Queue] Processing next queued message', {
+            id: nextInQueue.id,
+            queueLength: get().messageQueue.length,
+          })
+          // Remove from queue and send
+          get().removeFromQueue(nextInQueue.id)
+          // Use setTimeout to avoid blocking the current execution
+          setTimeout(() => {
+            get().sendMessage(nextInQueue.content, {
+              stream: true,
+              fileAttachments: nextInQueue.fileAttachments,
+              contexts: nextInQueue.contexts,
+              messageId: nextInQueue.id,
+            })
+          }, 100)
+        }
+
+        // Persist full message state (including contentBlocks), plan artifact, and config to database
+        const { currentChat, streamingPlanContent, mode, selectedModel } = get()
+        if (currentChat) {
+          try {
+            const currentMessages = get().messages
+            // Debug: Log what we're about to serialize
+            const lastMsg = currentMessages[currentMessages.length - 1]
+            if (lastMsg?.role === 'assistant') {
+              logger.info('[Stream Done] About to serialize - last message state', {
+                id: lastMsg.id,
+                contentLength: lastMsg.content?.length || 0,
+                hasContentBlocks: !!lastMsg.contentBlocks,
+                contentBlockCount: lastMsg.contentBlocks?.length || 0,
+                contentBlockTypes: (lastMsg.contentBlocks as any[])?.map((b) => b?.type) || [],
+              })
+            }
+            const dbMessages = validateMessagesForLLM(currentMessages)
+            const config = {
+              mode,
+              model: selectedModel,
+            }
+
+            const saveResponse = await fetch('/api/copilot/chat/update-messages', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chatId: currentChat.id,
+                messages: dbMessages,
+                planArtifact: streamingPlanContent || null,
+                config,
+              }),
+            })
+
+            if (!saveResponse.ok) {
+              const errorText = await saveResponse.text().catch(() => '')
+              logger.error('[Stream Done] Failed to save messages to DB', {
+                status: saveResponse.status,
+                error: errorText,
+              })
+            } else {
+              logger.info('[Stream Done] Successfully saved messages to DB', {
+                messageCount: dbMessages.length,
+              })
+            }
+
+            // Update local chat object with plan artifact and config
+            set({
+              currentChat: {
+                ...currentChat,
+                planArtifact: streamingPlanContent || null,
+                config,
+              },
+            })
+          } catch (err) {
+            logger.error('[Stream Done] Exception saving messages', { error: String(err) })
+          }
+        }
+
+        // Post copilot_stats record (input/output tokens can be null for now)
+        try {
+          // Removed: stats sending now occurs only on accept/reject with minimal payload
+        } catch {}
+
+        // Invalidate subscription queries to update usage
+        setTimeout(() => {
+          const queryClient = getQueryClient()
+          queryClient.invalidateQueries({ queryKey: subscriptionKeys.all })
+        }, 1000)
+      } finally {
+        clearTimeout(timeoutId)
+      }
+    },
+
+    // Handle new chat creation from stream
+    handleNewChatCreation: async (newChatId: string) => {
+      const { mode, selectedModel, streamingPlanContent } = get()
+      const newChat: CopilotChat = {
+        id: newChatId,
+        title: null,
+        model: selectedModel,
+        messages: get().messages,
+        messageCount: get().messages.length,
+        planArtifact: streamingPlanContent || null,
+        config: {
+          mode,
+          model: selectedModel,
+        },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }
+      // Abort any in-progress tools and clear diff on new chat creation
+      abortAllInProgressTools(set, get)
+      try {
+        useWorkflowDiffStore.getState().clearDiff()
+      } catch {}
+
+      set({
+        currentChat: newChat,
+        chats: [newChat, ...(get().chats || [])],
+        chatsLastLoadedAt: null,
+        chatsLoadedForWorkflow: null,
+        planTodos: [],
+        showPlanTodos: false,
+        suppressAutoSelect: false,
+      })
+    },
+
+    // Utilities
+    clearError: () => set({ error: null }),
+    clearSaveError: () => set({ saveError: null }),
+    clearCheckpointError: () => set({ checkpointError: null }),
+    retrySave: async (_chatId: string) => {},
+
+    cleanup: () => {
+      const { isSendingMessage } = get()
+      if (isSendingMessage) get().abortMessage()
+      if (streamingUpdateRAF !== null) {
+        cancelAnimationFrame(streamingUpdateRAF)
+        streamingUpdateRAF = null
+      }
+      streamingUpdateQueue.clear()
+      // Clear any diff on cleanup
+      try {
+        useWorkflowDiffStore.getState().clearDiff()
+      } catch {}
+    },
+
+    reset: () => {
+      get().cleanup()
+      // Abort in-progress tools prior to reset
+      abortAllInProgressTools(set, get)
+      set(initialState)
+    },
+
+    // Input controls
+    setInputValue: (value: string) => set({ inputValue: value }),
+    clearRevertState: () => set({ revertState: null }),
+
+    // Todo list (UI only)
+    setPlanTodos: (todos) => set({ planTodos: todos, showPlanTodos: true }),
+    updatePlanTodoStatus: (id, status) => {
+      set((state) => {
+        const updated = state.planTodos.map((t) =>
+          t.id === id
+            ? { ...t, completed: status === 'completed', executing: status === 'executing' }
+            : t
+        )
+        return { planTodos: updated }
+      })
+    },
+    closePlanTodos: () => set({ showPlanTodos: false }),
+
+    clearPlanArtifact: async () => {
+      const { currentChat } = get()
+
+      // Clear from local state
+      set({ streamingPlanContent: '' })
+
+      // Update database if we have a current chat
+      if (currentChat) {
+        try {
+          const currentMessages = get().messages
+          const dbMessages = validateMessagesForLLM(currentMessages)
+          const { mode, selectedModel } = get()
+
+          await fetch('/api/copilot/chat/update-messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chatId: currentChat.id,
+              messages: dbMessages,
+              planArtifact: null,
+              config: {
+                mode,
+                model: selectedModel,
+              },
+            }),
+          })
+
+          // Update local chat object
+          set({
+            currentChat: {
+              ...currentChat,
+              planArtifact: null,
+            },
+          })
+
+          logger.info('[PlanArtifact] Cleared plan artifact', { chatId: currentChat.id })
+        } catch (error) {
+          logger.error('[PlanArtifact] Failed to clear plan artifact', error)
+        }
+      }
+    },
+
+    savePlanArtifact: async (content: string) => {
+      const { currentChat } = get()
+
+      // Update local state
+      set({ streamingPlanContent: content })
+
+      // Update database if we have a current chat
+      if (currentChat) {
+        try {
+          const currentMessages = get().messages
+          const dbMessages = validateMessagesForLLM(currentMessages)
+          const { mode, selectedModel } = get()
+
+          await fetch('/api/copilot/chat/update-messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chatId: currentChat.id,
+              messages: dbMessages,
+              planArtifact: content,
+              config: {
+                mode,
+                model: selectedModel,
+              },
+            }),
+          })
+
+          // Update local chat object
+          set({
+            currentChat: {
+              ...currentChat,
+              planArtifact: content,
+            },
+          })
+
+          logger.info('[PlanArtifact] Saved plan artifact', {
+            chatId: currentChat.id,
+            contentLength: content.length,
+          })
+        } catch (error) {
+          logger.error('[PlanArtifact] Failed to save plan artifact', error)
+        }
+      }
+    },
+
+    setSelectedModel: async (model) => {
+      set({ selectedModel: model })
+    },
+    setAgentPrefetch: (prefetch) => set({ agentPrefetch: prefetch }),
+    setEnabledModels: (models) => set({ enabledModels: models }),
+
+    executeIntegrationTool: async (toolCallId: string) => {
+      const { toolCallsById, workflowId } = get()
+      const toolCall = toolCallsById[toolCallId]
+      if (!toolCall || !workflowId) return
+
+      const { id, name, params } = toolCall
+
+      // Set to executing state
+      const executingMap = { ...get().toolCallsById }
+      executingMap[id] = {
+        ...executingMap[id],
+        state: ClientToolCallState.executing,
+        display: resolveToolDisplay(name, ClientToolCallState.executing, id, params),
+      }
+      set({ toolCallsById: executingMap })
+      logger.info('[toolCallsById] pending → executing (integration tool)', { id, name })
+
+      try {
+        const res = await fetch('/api/copilot/execute-tool', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            toolCallId: id,
+            toolName: name,
+            arguments: params || {},
+            workflowId,
+          }),
+        })
+
+        const result = await res.json()
+        const success = result.success && result.result?.success
+        const completeMap = { ...get().toolCallsById }
+
+        // Do not override terminal review/rejected
+        if (
+          isRejectedState(completeMap[id]?.state) ||
+          isReviewState(completeMap[id]?.state) ||
+          isBackgroundState(completeMap[id]?.state)
+        ) {
+          return
+        }
+
+        completeMap[id] = {
+          ...completeMap[id],
+          state: success ? ClientToolCallState.success : ClientToolCallState.error,
+          display: resolveToolDisplay(
+            name,
+            success ? ClientToolCallState.success : ClientToolCallState.error,
+            id,
+            params
+          ),
+        }
+        set({ toolCallsById: completeMap })
+        logger.info(`[toolCallsById] executing → ${success ? 'success' : 'error'} (integration)`, {
+          id,
+          name,
+          result,
+        })
+
+        // Notify backend tool mark-complete endpoint
+        try {
+          await fetch('/api/copilot/tools/mark-complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id,
+              name: name || 'unknown_tool',
+              status: success ? 200 : 500,
+              message: success
+                ? result.result?.output?.content
+                : result.result?.error || result.error || 'Tool execution failed',
+              data: success
+                ? result.result?.output
+                : {
+                    error: result.result?.error || result.error,
+                    output: result.result?.output,
+                  },
+            }),
+          })
+        } catch {}
+      } catch (e) {
+        const errorMap = { ...get().toolCallsById }
+        // Do not override terminal review/rejected
+        if (
+          isRejectedState(errorMap[id]?.state) ||
+          isReviewState(errorMap[id]?.state) ||
+          isBackgroundState(errorMap[id]?.state)
+        ) {
+          return
+        }
+        errorMap[id] = {
+          ...errorMap[id],
+          state: ClientToolCallState.error,
+          display: resolveToolDisplay(name, ClientToolCallState.error, id, params),
+        }
+        set({ toolCallsById: errorMap })
+        logger.error('Integration tool execution failed', { id, name, error: e })
+      }
+    },
+
+    skipIntegrationTool: (toolCallId: string) => {
+      const { toolCallsById } = get()
+      const toolCall = toolCallsById[toolCallId]
+      if (!toolCall) return
+
+      const { id, name, params } = toolCall
+
+      // Set to rejected state
+      const rejectedMap = { ...get().toolCallsById }
+      rejectedMap[id] = {
+        ...rejectedMap[id],
+        state: ClientToolCallState.rejected,
+        display: resolveToolDisplay(name, ClientToolCallState.rejected, id, params),
+      }
+      set({ toolCallsById: rejectedMap })
+      logger.info('[toolCallsById] pending → rejected (integration tool skipped)', { id, name })
+
+      // Notify backend tool mark-complete endpoint with skip status
+      fetch('/api/copilot/tools/mark-complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id,
+          name: name || 'unknown_tool',
+          status: 200,
+          message: 'Tool execution skipped by user',
+          data: { skipped: true },
+        }),
+      }).catch(() => {})
+    },
+
+    loadAutoAllowedTools: async () => {
+      try {
+        const res = await fetch('/api/copilot/auto-allowed-tools')
+        if (res.ok) {
+          const data = await res.json()
+          set({ autoAllowedTools: data.autoAllowedTools || [] })
+          logger.info('[AutoAllowedTools] Loaded', { tools: data.autoAllowedTools })
+        }
+      } catch (err) {
+        logger.error('[AutoAllowedTools] Failed to load', { error: err })
+      }
+    },
+
+    addAutoAllowedTool: async (toolId: string) => {
+      try {
+        const res = await fetch('/api/copilot/auto-allowed-tools', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toolId }),
+        })
+        if (res.ok) {
+          const data = await res.json()
+          set({ autoAllowedTools: data.autoAllowedTools || [] })
+          logger.info('[AutoAllowedTools] Added tool', { toolId })
+        }
+      } catch (err) {
+        logger.error('[AutoAllowedTools] Failed to add tool', { toolId, error: err })
+      }
+    },
+
+    removeAutoAllowedTool: async (toolId: string) => {
+      try {
+        const res = await fetch(
+          `/api/copilot/auto-allowed-tools?toolId=${encodeURIComponent(toolId)}`,
+          {
+            method: 'DELETE',
+          }
+        )
+        if (res.ok) {
+          const data = await res.json()
+          set({ autoAllowedTools: data.autoAllowedTools || [] })
+          logger.info('[AutoAllowedTools] Removed tool', { toolId })
+        }
+      } catch (err) {
+        logger.error('[AutoAllowedTools] Failed to remove tool', { toolId, error: err })
+      }
+    },
+
+    isToolAutoAllowed: (toolId: string) => {
+      const { autoAllowedTools } = get()
+      return autoAllowedTools.includes(toolId)
+    },
+
+    // Message queue actions
+    addToQueue: (message, options) => {
+      const queuedMessage: import('./types').QueuedMessage = {
+        id: crypto.randomUUID(),
+        content: message,
+        fileAttachments: options?.fileAttachments,
+        contexts: options?.contexts,
+        queuedAt: Date.now(),
+      }
+      set({ messageQueue: [...get().messageQueue, queuedMessage] })
+      logger.info('[Queue] Message added to queue', {
+        id: queuedMessage.id,
+        queueLength: get().messageQueue.length,
+      })
+    },
+
+    removeFromQueue: (id) => {
+      set({ messageQueue: get().messageQueue.filter((m) => m.id !== id) })
+      logger.info('[Queue] Message removed from queue', {
+        id,
+        queueLength: get().messageQueue.length,
+      })
+    },
+
+    moveUpInQueue: (id) => {
+      const queue = [...get().messageQueue]
+      const index = queue.findIndex((m) => m.id === id)
+      if (index > 0) {
+        const item = queue[index]
+        queue.splice(index, 1)
+        queue.splice(index - 1, 0, item)
+        set({ messageQueue: queue })
+        logger.info('[Queue] Message moved up in queue', { id, newIndex: index - 1 })
+      }
+    },
+
+    sendNow: async (id) => {
+      const queue = get().messageQueue
+      const message = queue.find((m) => m.id === id)
+      if (!message) return
+
+      // Remove from queue first
+      get().removeFromQueue(id)
+
+      // If currently sending, abort and send this one
+      const { isSendingMessage } = get()
+      if (isSendingMessage) {
+        get().abortMessage()
+        // Wait a tick for abort to complete
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+
+      // Send the message
+      await get().sendMessage(message.content, {
+        stream: true,
+        fileAttachments: message.fileAttachments,
+        contexts: message.contexts,
+        messageId: message.id,
+      })
+    },
+
+    clearQueue: () => {
+      set({ messageQueue: [] })
+      logger.info('[Queue] Queue cleared')
+    },
+  }))
+)
+
+// Sync class-based tool instance state changes back into the store map
+try {
+  registerToolStateSync((toolCallId: string, nextState: any) => {
+    const state = useCopilotStore.getState()
+    const current = state.toolCallsById[toolCallId]
+    if (!current) return
+    let mapped: ClientToolCallState = current.state
+    if (nextState === 'executing') mapped = ClientToolCallState.executing
+    else if (nextState === 'pending') mapped = ClientToolCallState.pending
+    else if (nextState === 'success' || nextState === 'accepted')
+      mapped = ClientToolCallState.success
+    else if (nextState === 'error' || nextState === 'errored') mapped = ClientToolCallState.error
+    else if (nextState === 'rejected') mapped = ClientToolCallState.rejected
+    else if (nextState === 'aborted') mapped = ClientToolCallState.aborted
+    else if (nextState === 'review') mapped = (ClientToolCallState as any).review
+    else if (nextState === 'background') mapped = (ClientToolCallState as any).background
+    else if (typeof nextState === 'number') mapped = nextState as unknown as ClientToolCallState
+
+    // Store-authoritative gating: ignore invalid/downgrade transitions
+    const isTerminal = (s: ClientToolCallState) =>
+      s === ClientToolCallState.success ||
+      s === ClientToolCallState.error ||
+      s === ClientToolCallState.rejected ||
+      s === ClientToolCallState.aborted ||
+      (s as any) === (ClientToolCallState as any).review ||
+      (s as any) === (ClientToolCallState as any).background
+
+    // If we've already reached a terminal state, ignore any further non-terminal updates
+    if (isTerminal(current.state) && !isTerminal(mapped)) {
+      return
+    }
+    // Prevent downgrades (executing → pending, pending → generating)
+    if (
+      (current.state === ClientToolCallState.executing && mapped === ClientToolCallState.pending) ||
+      (current.state === ClientToolCallState.pending &&
+        mapped === (ClientToolCallState as any).generating)
+    ) {
+      return
+    }
+    // No-op if unchanged
+    if (mapped === current.state) return
+    const updated = {
+      ...state.toolCallsById,
+      [toolCallId]: {
+        ...current,
+        state: mapped,
+        display: resolveToolDisplay(current.name, mapped, toolCallId, current.params),
+      },
+    }
+    useCopilotStore.setState({ toolCallsById: updated })
+  })
+} catch {}
