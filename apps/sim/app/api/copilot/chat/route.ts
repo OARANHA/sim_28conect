@@ -7,7 +7,6 @@ import { z } from 'zod'
 import { getSession } from '@/lib/auth'
 import { generateChatTitle } from '@/lib/copilot/chat-title'
 import { getCopilotModel } from '@/lib/copilot/config'
-import { SIM_AGENT_API_URL_DEFAULT, SIM_AGENT_VERSION } from '@/lib/copilot/constants'
 import {
   authenticateCopilotRequestSessionOnly,
   createBadRequestResponse,
@@ -22,10 +21,15 @@ import { env } from '@/lib/core/config/env'
 import { CopilotFiles } from '@/lib/uploads'
 import { createFileContent } from '@/lib/uploads/utils/file-utils'
 import { tools } from '@/tools/registry'
+import { executeProviderRequest } from '@/providers'
+import { getProviderFromModel, isStreamingExecution } from '@/providers/utils'
+import {
+  convertCopilotToProviderRequest,
+  CopilotToolExecutor,
+  convertStreamingToSSE,
+} from '@/lib/copilot/adapters'
 
 const logger = createLogger('CopilotChatAPI')
-
-const SIM_AGENT_API_URL = env.SIM_AGENT_API_URL || SIM_AGENT_API_URL_DEFAULT
 
 const FileAttachmentSchema = z.object({
   id: z.string(),
@@ -405,86 +409,103 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const requestPayload = {
-      message: message, // Just send the current user message text
-      workflowId,
-      userId: authenticatedUserId,
-      stream: stream,
-      streamToolCalls: true,
-      model: model,
-      mode: mode,
-      messageId: userMessageIdToUse,
-      version: SIM_AGENT_VERSION,
-      ...(providerConfig ? { provider: providerConfig } : {}),
-      ...(effectiveConversationId ? { conversationId: effectiveConversationId } : {}),
-      ...(typeof prefetch === 'boolean' ? { prefetch: prefetch } : {}),
-      ...(session?.user?.name && { userName: session.user.name }),
-      ...(agentContexts.length > 0 && { context: agentContexts }),
-      ...(actualChatId ? { chatId: actualChatId } : {}),
-      ...(processedFileContents.length > 0 && { fileAttachments: processedFileContents }),
-      // For build/agent mode, include tools and credentials
-      ...(integrationTools.length > 0 && { tools: integrationTools }),
-      ...(baseTools.length > 0 && { baseTools }),
-      ...(credentials && { credentials }),
-    }
-
-    try {
-      logger.info(`[${tracker.requestId}] About to call Sim Agent`, {
-        hasContext: agentContexts.length > 0,
-        contextCount: agentContexts.length,
-        hasConversationId: !!effectiveConversationId,
-        hasFileAttachments: processedFileContents.length > 0,
-        messageLength: message.length,
-        mode,
-        hasTools: integrationTools.length > 0,
-        toolCount: integrationTools.length,
-        hasBaseTools: baseTools.length > 0,
-        baseToolCount: baseTools.length,
-        hasCredentials: !!credentials,
-        usingProvider: providerConfig?.provider || 'default',
-      })
-    } catch {}
-
-    // Determine the API URL based on provider configuration
-    let apiUrl = SIM_AGENT_API_URL
-    
-    // For openai-compatible provider, use custom base URL
-    if (providerConfig?.provider === 'openai-compatible' && providerConfig.baseUrl) {
-      apiUrl = providerConfig.baseUrl
-    }
-
-    const simAgentResponse = await fetch(`${apiUrl}/api/chat-completion-streaming`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(providerConfig?.apiKey ? { 'x-api-key': providerConfig.apiKey } : {}),
-      },
-      body: JSON.stringify(requestPayload),
+    // NEW: Use universal provider system instead of Sim Agent API
+    logger.info(`[${tracker.requestId}] Converting to provider request format`, {
+      mode,
+      model: modelToUse,
     })
 
-    if (!simAgentResponse.ok) {
-      if (simAgentResponse.status === 401 || simAgentResponse.status === 402) {
-        // Rethrow status only; client will render appropriate assistant message
-        return new NextResponse(null, { status: simAgentResponse.status })
-      }
+    // Get provider ID from model name
+    const providerId = getProviderFromModel(modelToUse)
 
-      const errorText = await simAgentResponse.text().catch(() => '')
-      logger.error(`[${tracker.requestId}] Sim agent API error:`, {
-        status: simAgentResponse.status,
-        error: errorText,
+    // Convert copilot format to ProviderRequest format
+    const providerRequest = convertCopilotToProviderRequest({
+      message,
+      model: modelToUse,
+      mode,
+      agentContexts,
+      conversationHistory: messages,
+      tools: integrationTools,
+      stream,
+      streamToolCalls: true,
+      userId: authenticatedUserId,
+      workspaceId: currentChat?.workspaceId,
+      workflowId,
+      chatId: actualChatId,
+      fileAttachments: processedFileContents.map((fc, idx) => ({
+        buffer: Buffer.from(0),
+        attachment: {
+          id: `file_${idx}`,
+          key: '',
+          filename: 'file',
+          media_type: typeof fc === 'object' && 'type' in fc ? (fc.type === 'image_url' ? 'image' : 'text') : 'text',
+          size: 0,
+        },
+      })),
+      implicitFeedback,
+    })
+
+    logger.info(`[${tracker.requestId}] Provider request converted`, {
+      providerId,
+      messageCount: providerRequest.messages?.length,
+      toolCount: providerRequest.tools?.length,
+      hasSystemPrompt: !!providerRequest.systemPrompt,
+    })
+
+    // Create tool executor if tools are available
+    let toolExecutor: CopilotToolExecutor | undefined
+    if (integrationTools.length > 0) {
+      toolExecutor = new CopilotToolExecutor({
+        tools: integrationTools,
+        credentials: credentials,
+        userId: authenticatedUserId,
+        workspaceId: currentChat?.workspaceId,
+        workflowId,
       })
-
-      return NextResponse.json(
-        { error: `Sim agent API error: ${simAgentResponse.statusText}` },
-        { status: simAgentResponse.status }
-      )
+      logger.info(`[${tracker.requestId}] Tool executor created`, {
+        toolCount: toolExecutor.getToolCount(),
+      })
     }
 
-    // If streaming is requested, forward the stream and update chat later
-    if (stream && simAgentResponse.body) {
-      // Create user message to save
+    // Execute using universal provider system
+    const result = await executeProviderRequest(providerId, providerRequest)
+
+    logger.info(`[${tracker.requestId}] Provider execution completed`, {
+      isStreaming: isStreamingExecution(result),
+      hasStream: 'stream' in result,
+    })
+
+    // Check if result is streaming
+    if (isStreamingExecution(result)) {
+      logger.info(`[${tracker.requestId}] Returning streaming response`, {
+        providerId,
+        model: modelToUse,
+        chatId: actualChatId,
+      })
+
+      // Convert streaming execution to SSE
+      const sseResponse = await convertStreamingToSSE(
+        result as any,
+        actualChatId,
+        toolExecutor
+      )
+
+      return sseResponse
+    }
+
+    // Non-streaming response
+    logger.info(`[${tracker.requestId}] Processing non-streaming response`, {
+      providerId,
+      model: modelToUse,
+      hasContent: !!(result as any).content,
+    })
+
+    const responseData = result as any
+
+    // Save messages if we have a chat
+    if (currentChat && responseData.content) {
       const userMessage = {
-        id: userMessageIdToUse, // Consistent ID used for request and persistence
+        id: userMessageIdToUse,
         role: 'user',
         content: message,
         timestamp: new Date().toISOString(),
@@ -496,314 +517,63 @@ export async function POST(req: NextRequest) {
           }),
       }
 
-      // Create a pass-through stream that captures the response
-      const transformedStream = new ReadableStream({
-        async start(controller) {
-          const encoder = new TextEncoder()
-          let assistantContent = ''
-          const toolCalls: any[] = []
-          let buffer = ''
-          const isFirstDone = true
-          let responseIdFromStart: string | undefined
-          let responseIdFromDone: string | undefined
-          // Track tool call progress to identify a safe done event
-          const announcedToolCallIds = new Set<string>()
-          const startedToolExecutionIds = new Set<string>()
-          const completedToolExecutionIds = new Set<string>()
-          let lastDoneResponseId: string | undefined
-          let lastSafeDoneResponseId: string | undefined
+      const assistantMessage = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: responseData.content,
+        timestamp: new Date().toISOString(),
+      }
 
-          // Send chatId as first event
-          if (actualChatId) {
-            const chatIdEvent = `data: ${JSON.stringify({
-              type: 'chat_id',
-              chatId: actualChatId,
-            })}\n\n`
-            controller.enqueue(encoder.encode(chatIdEvent))
-            logger.debug(`[${tracker.requestId}] Sent initial chatId event to client`)
-          }
+      const updatedMessages = [...conversationHistory, userMessage, assistantMessage]
 
-          // Start title generation in parallel if needed
-          if (actualChatId && !currentChat?.title && conversationHistory.length === 0) {
-            generateChatTitle(message)
-              .then(async (title) => {
-                if (title) {
-                  await db
-                    .update(copilotChats)
-                    .set({
-                      title,
-                      updatedAt: new Date(),
-                    })
-                    .where(eq(copilotChats.id, actualChatId!))
-
-                  const titleEvent = `data: ${JSON.stringify({
-                    type: 'title_updated',
-                    title: title,
-                  })}\n\n`
-                  controller.enqueue(encoder.encode(titleEvent))
-                  logger.info(`[${tracker.requestId}] Generated and saved title: ${title}`)
-                }
-              })
-              .catch((error) => {
-                logger.error(`[${tracker.requestId}] Title generation failed:`, error)
-              })
-          } else {
-            logger.debug(`[${tracker.requestId}] Skipping title generation`)
-          }
-
-          // Forward the sim agent stream and capture assistant response
-          const reader = simAgentResponse.body!.getReader()
-          const decoder = new TextDecoder()
-
-          try {
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) {
-                break
-              }
-
-              // Decode and parse SSE events for logging and capturing content
-              const decodedChunk = decoder.decode(value, { stream: true })
-              buffer += decodedChunk
-
-              const lines = buffer.split('\n')
-              buffer = lines.pop() || '' // Keep incomplete line in buffer
-
-              for (const line of lines) {
-                if (line.trim() === '') continue // Skip empty lines
-
-                if (line.startsWith('data: ') && line.length > 6) {
-                  try {
-                    const jsonStr = line.slice(6)
-
-                    // Check if the JSON string is unusually large (potential streaming issue)
-                    if (jsonStr.length > 50000) {
-                      // 50KB limit
-                      logger.warn(`[${tracker.requestId}] Large SSE event detected`, {
-                        size: jsonStr.length,
-                        preview: `${jsonStr.substring(0, 100)}...`,
-                      })
-                    }
-
-                    const event = JSON.parse(jsonStr)
-
-                    // Log different event types comprehensively
-                    switch (event.type) {
-                      case 'content':
-                        if (event.data) {
-                          assistantContent += event.data
-                        }
-                        break
-
-                      case 'reasoning':
-                        logger.debug(
-                          `[${tracker.requestId}] Reasoning chunk received (${(event.data || event.content || '').length} chars)`
-                        )
-                        break
-
-                      case 'tool_call':
-                        if (!event.data?.partial) {
-                          toolCalls.push(event.data)
-                          if (event.data?.id) {
-                            announcedToolCallIds.add(event.data.id)
-                          }
-                        }
-                        break
-
-                      case 'tool_generating':
-                        if (event.toolCallId) {
-                          startedToolExecutionIds.add(event.toolCallId)
-                        }
-                        break
-
-                      case 'tool_result':
-                        if (event.toolCallId) {
-                          completedToolExecutionIds.add(event.toolCallId)
-                        }
-                        break
-
-                      case 'tool_error':
-                        logger.error(`[${tracker.requestId}] Tool error:`, {
-                          toolCallId: event.toolCallId,
-                          toolName: event.toolName,
-                          error: event.error,
-                          success: event.success,
-                        })
-                        if (event.toolCallId) {
-                          completedToolExecutionIds.add(event.toolCallId)
-                        }
-                        break
-
-                      case 'start':
-                        if (event.data?.responseId) {
-                          responseIdFromStart = event.data.responseId
-                        }
-                        break
-
-                      case 'done':
-                        if (event.data?.responseId) {
-                          responseIdFromDone = event.data.responseId
-                          lastDoneResponseId = responseIdFromDone
-
-                          // Mark this done as safe only if no tool call is currently in progress or pending
-                          const announced = announcedToolCallIds.size
-                          const completed = completedToolExecutionIds.size
-                          const started = startedToolExecutionIds.size
-                          const hasToolInProgress = announced > completed || started > completed
-                          if (!hasToolInProgress) {
-                            lastSafeDoneResponseId = responseIdFromDone
-                          }
-                        }
-                        break
-
-                      case 'error':
-                        break
-
-                      default:
-                    }
-
-                    // Emit to client: rewrite 'error' events into user-friendly assistant message
-                    if (event?.type === 'error') {
-                      try {
-                        const displayMessage: string =
-                          (event?.data && (event.data.displayMessage as string)) ||
-                          'Sorry, I encountered an error. Please try again.'
-                        const formatted = `_${displayMessage}_`
-                        // Accumulate so it persists to DB as assistant content
-                        assistantContent += formatted
-                        // Send as content chunk
-                        try {
-                          controller.enqueue(
-                            encoder.encode(
-                              `data: ${JSON.stringify({ type: 'content', data: formatted })}\n\n`
-                            )
-                          )
-                        } catch (enqueueErr) {
-                          reader.cancel()
-                          break
-                        }
-                        // Then close this response cleanly for the client
-                        try {
-                          controller.enqueue(
-                            encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
-                          )
-                        } catch (enqueueErr) {
-                          reader.cancel()
-                          break
-                        }
-                      } catch {}
-                      // Do not forward the original error event
-                    } else {
-                      // Forward original event to client
-                      try {
-                        controller.enqueue(encoder.encode(`data: ${jsonStr}\n\n`))
-                      } catch (enqueueErr) {
-                        reader.cancel()
-                        break
-                      }
-                    }
-                  } catch (e) {
-                    // Enhanced error handling for large payloads and parsing issues
-                    const lineLength = line.length
-                    const isLargePayload = lineLength > 10000
-
-                    if (isLargePayload) {
-                      logger.error(
-                        `[${tracker.requestId}] Failed to parse large SSE event (${lineLength} chars)`,
-                        {
-                          error: e,
-                          preview: `${line.substring(0, 200)}...`,
-                          size: lineLength,
-                        }
-                      )
-                    } else {
-                      logger.warn(
-                        `[${tracker.requestId}] Failed to parse SSE event: "${line.substring(0, 200)}..."`,
-                        e
-                      )
-                    }
-                  }
-                } else if (line.trim() && line !== 'data: [DONE]') {
-                  logger.debug(`[${tracker.requestId}] Non-SSE line from sim agent: "${line}"`)
-                }
-              }
+      // Start title generation in parallel if this is first message (non-streaming)
+      if (actualChatId && !currentChat.title && conversationHistory.length === 0) {
+        logger.info(`[${tracker.requestId}] Starting title generation for non-streaming response`)
+        generateChatTitle(message)
+          .then(async (title) => {
+            if (title) {
+              await db
+                .update(copilotChats)
+                .set({
+                  title,
+                  updatedAt: new Date(),
+                })
+                .where(eq(copilotChats.id, actualChatId!))
+              logger.info(`[${tracker.requestId}] Generated and saved title: ${title}`)
             }
+          })
+          .catch((error) => {
+            logger.error(`[${tracker.requestId}] Title generation failed:`, error)
+          })
+      }
 
-            // Process any remaining buffer
-            if (buffer.trim()) {
-              logger.debug(`[${tracker.requestId}] Processing remaining buffer: "${buffer}"`)
-              if (buffer.startsWith('data: ')) {
-                try {
-                  const jsonStr = buffer.slice(6)
-                  const event = JSON.parse(jsonStr)
-                  if (event.type === 'content' && event.data) {
-                    assistantContent += event.data
-                  }
-                  // Forward remaining event, applying same error rewrite behavior
-                  if (event?.type === 'error') {
-                    const displayMessage: string =
-                      (event?.data && (event.data.displayMessage as string)) ||
-                      'Sorry, I encountered an error. Please try again.'
-                    const formatted = `_${displayMessage}_`
-                    assistantContent += formatted
-                    try {
-                      controller.enqueue(
-                        encoder.encode(
-                          `data: ${JSON.stringify({ type: 'content', data: formatted })}\n\n`
-                        )
-                      )
-                      controller.enqueue(
-                        encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
-                      )
-                    } catch (enqueueErr) {
-                      reader.cancel()
-                    }
-                  } else {
-                    try {
-                      controller.enqueue(encoder.encode(`data: ${jsonStr}\n\n`))
-                    } catch (enqueueErr) {
-                      reader.cancel()
-                    }
-                  }
-                } catch (e) {
-                  logger.warn(`[${tracker.requestId}] Failed to parse final buffer: "${buffer}"`)
-                }
-              }
-            }
+      // Update chat in database immediately (without blocking for title)
+      await db
+        .update(copilotChats)
+        .set({
+          messages: updatedMessages,
+          updatedAt: new Date(),
+        })
+        .where(eq(copilotChats.id, actualChatId!))
+    }
 
-            // Log final streaming summary
-            logger.info(`[${tracker.requestId}] Streaming complete summary:`, {
-              totalContentLength: assistantContent.length,
-              toolCallsCount: toolCalls.length,
-              hasContent: assistantContent.length > 0,
-              toolNames: toolCalls.map((tc) => tc?.name).filter(Boolean),
-            })
+    logger.info(`[${tracker.requestId}] Returning non-streaming response`, {
+      duration: tracker.getDuration(),
+      chatId: actualChatId,
+      responseLength: responseData.content?.length || 0,
+    })
 
-            // NOTE: Messages are saved by the client via update-messages endpoint with full contentBlocks.
-            // Server only updates conversationId here to avoid overwriting client's richer save.
-            if (currentChat) {
-              // Persist only a safe conversationId to avoid continuing from a state that expects tool outputs
-              const previousConversationId = currentChat?.conversationId as string | undefined
-              const responseId = lastSafeDoneResponseId || previousConversationId || undefined
-
-              if (responseId) {
-                await db
-                  .update(copilotChats)
-                  .set({
-                    updatedAt: new Date(),
-                    conversationId: responseId,
-                  })
-                  .where(eq(copilotChats.id, actualChatId!))
-
-                logger.info(
-                  `[${tracker.requestId}] Updated conversationId for chat ${actualChatId}`,
-                  {
-                    updatedConversationId: responseId,
-                  }
-                )
-              }
-            }
-          } catch (error) {
+    return NextResponse.json({
+      success: true,
+      response: responseData,
+      chatId: actualChatId,
+      metadata: {
+        requestId: tracker.requestId,
+        message,
+        duration: tracker.getDuration(),
+      },
+    })
+  } catch (error) {
             logger.error(`[${tracker.requestId}] Error processing stream:`, error)
 
             // Send an error event to the client before closing so it knows what happened
@@ -837,28 +607,8 @@ export async function POST(req: NextRequest) {
             }
           }
         },
-      })
 
-      const response = new Response(transformedStream, {
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          Connection: 'keep-alive',
-          'X-Accel-Buffering': 'no',
-        },
-      })
-
-      logger.info(`[${tracker.requestId}] Returning streaming response to client`, {
-        duration: tracker.getDuration(),
-        chatId: actualChatId,
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          Connection: 'keep-alive',
-        },
-      })
-
-      return response
+    logger.info(`[${tracker.requestId}] Returning non-streaming response`, {
     }
 
     // For non-streaming responses
@@ -979,10 +729,11 @@ export async function POST(req: NextRequest) {
       { error: error instanceof Error ? error.message : 'Internal server error' },
       { status: 500 }
     )
-  }
-}
+            }
+          }
+        },
 
-export async function GET(req: NextRequest) {
+    // Non-streaming response
   try {
     const { searchParams } = new URL(req.url)
     const workflowId = searchParams.get('workflowId')
