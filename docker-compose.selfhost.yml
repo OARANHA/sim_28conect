@@ -73,8 +73,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 10G
-          cpus: '6'
+          memory: 8G
+          cpus: '4'
     healthcheck:
       test: ['CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3000']
       interval: 90s
