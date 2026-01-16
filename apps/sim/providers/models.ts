@@ -982,6 +982,43 @@ export const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
       },
     ],
   },
+  'z-ai': {
+    id: 'z-ai',
+    name: 'Z.AI',
+    description: "Z.AI's chat models",
+    defaultModel: 'z-ai/fast',
+    modelPatterns: [/^z-ai\//],
+    icon: xAIIcon,
+    capabilities: {
+      toolUsageControl: true,
+    },
+    models: [
+      {
+        id: 'z-ai/fast',
+        pricing: {
+          input: 0.5,
+          output: 0.5,
+          updatedAt: '2025-12-02',
+        },
+        capabilities: {
+          temperature: { min: 0, max: 1 },
+        },
+        contextWindow: 256000,
+      },
+      {
+        id: 'z-ai/creative',
+        pricing: {
+          input: 0.5,
+          output: 0.5,
+          updatedAt: '2025-12-02',
+        },
+        capabilities: {
+          temperature: { min: 0, max: 1 },
+        },
+        contextWindow: 256000,
+      },
+    ],
+  },
   xai: {
     id: 'xai',
     name: 'xAI',
