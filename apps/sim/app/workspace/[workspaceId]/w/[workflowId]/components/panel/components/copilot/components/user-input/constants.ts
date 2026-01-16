@@ -24,26 +24,17 @@ export const MODEL_OPTIONS = [
   { value: 'claude-4.5-opus', label: 'Claude 4.5 Opus' },
   { value: 'claude-4.5-sonnet', label: 'Claude 4.5 Sonnet' },
   { value: 'claude-4.5-haiku', label: 'Claude 4.5 Haiku' },
-  // { value: 'claude-4-sonnet', label: 'Claude 4 Sonnet' },
-  // { value: 'claude-4.1-opus', label: 'Claude 4.1 Opus' },
-  
+
   // OpenAI GPT models
   { value: 'gpt-5.1-codex', label: 'GPT 5.1 Codex' },
   { value: 'gpt-5.1-medium', label: 'GPT 5.1 Medium' },
-  // { value: 'gpt-5-codex', label: 'GPT 5 Codex' },
-  // { value: 'gpt-5-fast', label: 'GPT 5 Fast' },
-  // { value: 'gpt-5', label: 'GPT 5' },
-  // { value: 'gpt-5.1-fast', label: 'GPT 5.1 Fast' },
-  // { value: 'gpt-5.1', label: 'GPT 5.1' },
-  // { value: 'gpt-5.1-high', label: 'GPT 5.1 High' },
-  // { value: 'gpt-5-high', label: 'GPT 5 High' },
-  // { value: 'gpt-4o', label: 'GPT 4o' },
-  // { value: 'gpt-4.1', label: 'GPT 4.1' },
-  // { value: 'o3', label: 'o3' },
-  
+  { value: 'gpt-5.1-fast', label: 'GPT 5.1 Fast' },
+  { value: 'gpt-5.1', label: 'GPT 5.1' },
+  { value: 'gpt-5.1-high', label: 'GPT 5.1 High' },
+
   // Google Gemini models
   { value: 'gemini-3-pro', label: 'Gemini 3 Pro' },
-  
+
   // Mistral AI models
   { value: 'mistral-large-latest', label: 'Mistral Large Latest' },
   { value: 'mistral-small-latest', label: 'Mistral Small Latest' },
@@ -52,30 +43,51 @@ export const MODEL_OPTIONS = [
   { value: 'ministral-3b-latest', label: 'Ministral 3B Latest' },
   { value: 'pixtral-large-latest', label: 'Pixtral Large Latest' },
   { value: 'pixtral-12b', label: 'Pixtral 12B' },
-  
+
   // Z.AI models (custom models)
-  { value: 'z-ai/default', label: 'Z.AI Default' },
   { value: 'z-ai/fast', label: 'Z.AI Fast' },
   { value: 'z-ai/creative', label: 'Z.AI Creative' },
+
+  // AWS Bedrock models (not supported yet)
+  // { value: 'bedrock', label: 'AWS Bedrock' },
+  // { value: 'cerebras', label: 'Cerebras' },
+  // { value: 'groq', label: 'Groq' },
+  // { value: 'together', label: 'Together AI' },
+  // { value: 'deepseek', label: 'DeepSeek' },
+  // { value: 'xai', label: 'xAI (Grok)' },
 ] as const
 
 /**
  * Provider configuration options
+ * These match providers supported by Copilot backend API (sim, openai-compatible, mistral, z-ai, azure-openai, vertex)
+ * Plus additional workspace providers (anthropic, google, mistral, groq, together, xai, deepseek, bedrock, cerebras)
  */
 export const PROVIDER_OPTIONS = [
   { value: 'default', label: 'Default (from .env)', icon: '⚙️' },
-  { value: 'anthropic', label: 'Anthropic (Claude)', icon: '🤖' },
-  { value: 'openai', label: 'OpenAI (GPT)', icon: '🧠' },
+  { value: 'sim', label: 'Sim.ai (Managed)', icon: '🌟' },
+  { value: 'openai-compatible', label: 'OpenAI Compatible', icon: '🧠' },
   { value: 'mistral', label: 'Mistral AI', icon: '⚡' },
   { value: 'z-ai', label: 'Z.AI', icon: '🚀' },
   { value: 'azure-openai', label: 'Azure OpenAI', icon: '☁️' },
   { value: 'vertex', label: 'Vertex AI', icon: '🌐' },
+  // Existing workspace providers
+  { value: 'anthropic', label: 'Anthropic (Claude)', icon: '🤖' },
   { value: 'google', label: 'Google (Gemini)', icon: '🔷' },
-  { value: 'xai', label: 'xAI (Grok)', icon: '✖️' },
-  { value: 'deepseek', label: 'Deepseek', icon: '🔍' },
-  { value: 'bedrock', label: 'AWS Bedrock', icon: '🪨' },
-  { value: 'cerebras', label: 'Cerebras', icon: '🧠' },
+  // Existing workspace providers
+  { value: 'mistral', label: 'Mistral AI', icon: '⚡' },
+  // Existing workspace providers
   { value: 'groq', label: 'Groq', icon: '⚡' },
+  // Existing workspace providers
+  { value: 'together', label: 'Together AI', icon: '🤝' },
+  // Existing workspace providers
+  { value: 'xai', label: 'xAI (Grok)', icon: '✖️' },
+  // Existing workspace providers
+  { value: 'deepseek', label: 'DeepSeek', icon: '🔍' },
+  // Existing workspace providers
+  { value: 'bedrock', label: 'AWS Bedrock', icon: '🪨' },
+  // Existing workspace providers
+  { value: 'cerebras', label: 'Cerebras', icon: '🧠' },
+  // Existing workspace providers
 ] as const
 
 /**
