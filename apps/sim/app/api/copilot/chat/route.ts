@@ -41,27 +41,8 @@ const ChatMessageSchema = z.object({
   chatId: z.string().optional(),
   workflowId: z.string().min(1, 'Workflow ID is required'),
   model: z
-    .enum([
-      'gpt-5-fast',
-      'gpt-5',
-      'gpt-5-medium',
-      'gpt-5-high',
-      'gpt-5.1-fast',
-      'gpt-5.1',
-      'gpt-5.1-medium',
-      'gpt-5.1-high',
-      'gpt-5-codex',
-      'gpt-5.1-codex',
-      'gpt-4o',
-      'gpt-4.1',
-      'o3',
-      'claude-4-sonnet',
-      'claude-4.5-haiku',
-      'claude-4.5-sonnet',
-      'claude-4.5-opus',
-      'claude-4.1-opus',
-      'gemini-3-pro',
-    ])
+    .string()
+    .min(1, 'Model name is required')
     .optional()
     .default('claude-4.5-opus'),
   mode: z.enum(['ask', 'agent', 'plan']).optional().default('agent'),
