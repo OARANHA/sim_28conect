@@ -7,6 +7,7 @@ import { z } from 'zod'
 import { getSession } from '@/lib/auth'
 import { generateChatTitle } from '@/lib/copilot/chat-title'
 import { getCopilotModel } from '@/lib/copilot/config'
+import { SIM_AGENT_API_URL_DEFAULT, SIM_AGENT_VERSION } from '@/lib/copilot/constants'
 import {
   authenticateCopilotRequestSessionOnly,
   createBadRequestResponse,
@@ -21,15 +22,10 @@ import { env } from '@/lib/core/config/env'
 import { CopilotFiles } from '@/lib/uploads'
 import { createFileContent } from '@/lib/uploads/utils/file-utils'
 import { tools } from '@/tools/registry'
-import { executeProviderRequest } from '@/providers'
-import { getProviderFromModel, isStreamingExecution } from '@/providers/utils'
-import {
-  convertCopilotToProviderRequest,
-  CopilotToolExecutor,
-  convertStreamingToSSE,
-} from '@/lib/copilot/adapters'
 
 const logger = createLogger('CopilotChatAPI')
+
+const SIM_AGENT_API_URL = env.SIM_AGENT_API_URL || SIM_AGENT_API_URL_DEFAULT
 
 const FileAttachmentSchema = z.object({
   id: z.string(),
@@ -409,80 +405,81 @@ export async function POST(req: NextRequest) {
       }
     }
 
-		const providerId = getProviderFromModel(modelToUse)
-		const providerRequest = convertCopilotToProviderRequest({
-		message,
-		model: modelToUse,
-		mode,
-		agentContexts,
-		conversationHistory: messages,
-		tools: integrationTools,
-		stream,
-		streamToolCalls: true,
-		userId: authenticatedUserId,
-		workspaceId: currentChat?.workspaceId,
-		workflowId,
-		chatId: actualChatId,
-		fileAttachments: processedFileContents.map((fc) => ({
-			buffer: Buffer.from(0),
-			attachment: {
-			id: fc.id,
-			key: fc.key,
-			filename: fc.filename,
-			media_type: fc.media_type,
-			size: fc.size,
-			},
-		})),
-		implicitFeedback,
-		})
-	
-		logger.info(`[${tracker.requestId}] Calling universal provider`, {
-		providerId,
-		model: modelToUse,
-		hasTools: integrationTools.length > 0,
-		})
-	
-		const result = await executeProviderRequest(providerId, providerRequest)
-	
-		if (isStreamingExecution(result)) {
-		logger.info(`[${tracker.requestId}] Returning streaming response`, {
-			providerId,
-			model: modelToUse,
-			chatId: actualChatId,
-		})
-	
-		let toolExecutor: CopilotToolExecutor | undefined
-		if (integrationTools.length > 0) {
-			toolExecutor = new CopilotToolExecutor({
-			tools: integrationTools,
-			credentials: credentials,
-			userId: authenticatedUserId,
-			workspaceId: currentChat?.workspaceId,
-			workflowId,
-			})
-		}
-	
-		return await convertStreamingToSSE(result, actualChatId, toolExecutor)
-		}
-	
-		const responseData = result as any
-	
-		logger.info(`[${tracker.requestId}] Returning non-streaming response`, {
-		hasContent: !!responseData.content,
-		contentLength: responseData.content?.length || 0,
-		})
-	
-		return NextResponse.json({
-		success: true,
-		response: responseData,
-		chatId: actualChatId,
-		metadata: {
-			requestId: tracker.requestId,
-			message,
-			duration: tracker.getDuration(),
-		},
-		})
-	
+    const requestPayload = {
+      message: message, // Just send the current user message text
+      workflowId,
+      userId: authenticatedUserId,
+      stream: stream,
+      streamToolCalls: true,
+      model: model,
+      mode: mode,
+      messageId: userMessageIdToUse,
+      version: SIM_AGENT_VERSION,
+      ...(providerConfig ? { provider: providerConfig } : {}),
+      ...(effectiveConversationId ? { conversationId: effectiveConversationId } : {}),
+      ...(typeof prefetch === 'boolean' ? { prefetch: prefetch } : {}),
+      ...(session?.user?.name && { userName: session.user.name }),
+      ...(agentContexts.length > 0 && { context: agentContexts }),
+      ...(actualChatId ? { chatId: actualChatId } : {}),
+      ...(processedFileContents.length > 0 && { fileAttachments: processedFileContents }),
+      // For build/agent mode, include tools and credentials
+      ...(integrationTools.length > 0 && { tools: integrationTools }),
+      ...(baseTools.length > 0 && { baseTools }),
+      ...(credentials && { credentials }),
+    }
+
+    try {
+      logger.info(`[${tracker.requestId}] About to call Sim Agent`, {
+        hasContext: agentContexts.length > 0,
+        contextCount: agentContexts.length,
+        hasConversationId: !!effectiveConversationId,
+        hasFileAttachments: processedFileContents.length > 0,
+        messageLength: message.length,
+        mode,
+        hasTools: integrationTools.length > 0,
+        toolCount: integrationTools.length,
+        hasBaseTools: baseTools.length > 0,
+        baseToolCount: baseTools.length,
+        hasCredentials: !!credentials,
+        usingProvider: providerConfig?.provider || 'default',
+      })
+    } catch {}
+
+    // Determine the API URL based on provider configuration
+    let apiUrl = SIM_AGENT_API_URL
+    
+    // For openai-compatible provider, use custom base URL
+    if (providerConfig?.provider === 'openai-compatible' && providerConfig.baseUrl) {
+      apiUrl = providerConfig.baseUrl
+    }
+
+    const simAgentResponse = await fetch(`${apiUrl}/api/chat-completion-streaming`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(providerConfig?.apiKey ? { 'x-api-key': providerConfig.apiKey } : {}),
+      },
+      body: JSON.stringify(requestPayload),
+    })
+
+    if (!simAgentResponse.ok) {
+      if (simAgentResponse.status === 401 || simAgentResponse.status === 402) {
+        // Rethrow status only; client will render appropriate assistant message
+        return new NextResponse(null, { status: simAgentResponse.status })
+      }
+
+      const errorText = await simAgentResponse.text().catch(() => '')
+      logger.error(`[${tracker.requestId}] Sim agent API error:`, {
+        status: simAgentResponse.status,
+        error: errorText,
+      })
+
+      return NextResponse.json(
+        { error: `Sim agent API error: ${simAgentResponse.statusText}` },
+        { status: simAgentResponse.status }
+      )
+    }
+
     // If streaming is requested, forward the stream and update chat later
     if (stream && simAgentResponse.body) {
       // Create user message to save
