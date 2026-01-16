@@ -2518,6 +2518,7 @@ export const useCopilotStore = create<CopilotStore>()(
           workflowId: workflowId || undefined,
           mode: apiMode,
           model: get().selectedModel,
+          provider: get().selectedProvider, // Pass selected provider from store
           prefetch: get().agentPrefetch,
           createNewChat: !currentChat,
           stream,
