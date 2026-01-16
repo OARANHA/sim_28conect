@@ -1300,6 +1300,7 @@ export const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
       /^codestral/,
       /^ministral/,
       /^devstral/,
+      /^pixtral/,
     ],
     icon: MistralIcon,
     capabilities: {
