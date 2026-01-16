@@ -55,6 +55,7 @@ export function getProviderConfig(providerOverride?: string): CopilotProviderCon
   // Direct Mistral provider
   if (provider === 'mistral') {
     const apiKey = env.MISTRAL_API_KEY || env.COPILOT_API_KEY
+    const baseUrl = env.MISTRAL_BASE_URL || env.COPILOT_BASE_URL
     if (!apiKey) {
       logger.error('MISTRAL_API_KEY or COPILOT_API_KEY is required for mistral provider')
       throw new Error('MISTRAL_API_KEY or COPILOT_API_KEY is required for mistral provider')
@@ -63,6 +64,7 @@ export function getProviderConfig(providerOverride?: string): CopilotProviderCon
       provider: 'mistral',
       model,
       apiKey,
+      baseUrl,
     }
   }
 

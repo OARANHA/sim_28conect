@@ -166,7 +166,8 @@ export type CopilotProviderConfig =
       baseUrl?: string
     }
   | {
-      provider: Exclude<ProviderId, 'sim' | 'azure-openai' | 'vertex' | 'openai-compatible'>
-      model?: string
-      apiKey?: string
-    }
+    provider: Exclude<ProviderId, 'sim' | 'azure-openai' | 'vertex' | 'openai-compatible'>
+    model?: string
+    apiKey?: string
+    baseUrl?: string
+  }
