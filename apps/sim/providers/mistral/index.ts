@@ -35,13 +35,13 @@ export const mistralProvider: ProviderConfig = {
   executeRequest: async (
     request: ProviderRequest
   ): Promise<ProviderResponse | StreamingExecution> => {
-    logger.info('Preparing Mistral request', {
+    logger.info('=== MISTRAL PROVIDER START ===')
+    logger.info('Request details:', {
       model: request.model,
       hasSystemPrompt: !!request.systemPrompt,
       hasMessages: !!request.messages?.length,
       hasTools: !!request.tools?.length,
       toolCount: request.tools?.length || 0,
-      hasResponseFormat: !!request.responseFormat,
       stream: !!request.stream,
     })
 
@@ -50,7 +50,7 @@ export const mistralProvider: ProviderConfig = {
       throw new Error('API key is required for Mistral AI')
     }
 
-    logger.info('Creating Mistral client and preparing request')
+    logger.info('Creating Mistral client with API key length:', request.apiKey?.length || 0)
 
     const mistral = new OpenAI({
       apiKey: request.apiKey,
@@ -130,6 +130,8 @@ export const mistralProvider: ProviderConfig = {
     let preparedTools: ReturnType<typeof prepareToolsWithUsageControl> | null = null
 
     if (tools?.length) {
+      logger.info('Input tools:', JSON.stringify(tools.slice(0, 2), null, 2))
+
       preparedTools = prepareToolsWithUsageControl(tools, request.tools, logger, 'mistral')
       const { tools: filteredTools, toolChoice } = preparedTools
 
@@ -153,13 +155,12 @@ export const mistralProvider: ProviderConfig = {
       logger.info('No tools provided for this request')
     }
 
-    // Log full payload for debugging
-    logger.info('Final Mistral payload:', {
+    logger.info('Final payload (without messages):', {
       model: payload.model,
-      messagesCount: payload.messages.length,
       hasTools: !!payload.tools,
       toolCount: payload.tools?.length || 0,
       hasToolChoice: !!payload.tool_choice,
+      toolChoiceValue: JSON.stringify(payload.tool_choice),
     })
 
     const providerStartTime = Date.now()
