@@ -29,7 +29,7 @@ function sanitizeRequest(request: ProviderRequest): ProviderRequest {
   return sanitizedRequest
 }
 
-function isStreamingExecution(response: any): response is StreamingExecution {
+export function isStreamingExecution(response: any): response is StreamingExecution {
   return response && typeof response === 'object' && 'stream' in response && 'execution' in response
 }
 
