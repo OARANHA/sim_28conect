@@ -377,7 +377,7 @@ export async function POST(req: NextRequest) {
       workflowId,
       chatId: actualChatId,
       fileAttachments: processedFileContents.map((fc) => ({
-        buffer: Buffer.from(0),
+        buffer: Buffer.alloc(0),
         attachment: {
           id: fc.id,
           key: fc.key,
@@ -388,6 +388,12 @@ export async function POST(req: NextRequest) {
       })),
       implicitFeedback,
     })
+
+    if (providerId === 'mistral') {
+      providerRequest.apiKey = env.MISTRAL_API_KEY || env.COPILOT_API_KEY
+    } else {
+      providerRequest.apiKey = env.COPILOT_API_KEY
+    }
 
     logger.info(`[${tracker.requestId}] Calling universal provider`, {
       providerId,
