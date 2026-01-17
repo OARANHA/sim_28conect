@@ -1,5 +1,4 @@
 import { createLogger } from '@sim/logger'
-import type { AgentContext } from '@/lib/copilot/process-contents'
 import { createFileContent } from '@/lib/uploads/utils/file-utils'
 import type { Message, ProviderRequest, ProviderToolConfig } from '@/providers/types'
 import type { CopilotToolConfig } from '@/stores/panel/copilot/types'
@@ -23,9 +22,7 @@ interface ConvertParams {
   implicitFeedback?: string
 }
 
-export function convertCopilotToProviderRequest(
-  params: ConvertParams
-): ProviderRequest {
+export function convertCopilotToProviderRequest(params: ConvertParams): ProviderRequest {
   const {
     message,
     model,
@@ -93,8 +90,7 @@ function buildSystemPrompt(
 
   switch (mode) {
     case 'ask':
-      basePrompt =
-        'You are a helpful AI assistant. Answer questions directly and concisely.'
+      basePrompt = 'You are a helpful AI assistant. Answer questions directly and concisely.'
       break
     case 'agent':
       basePrompt =
@@ -107,9 +103,7 @@ function buildSystemPrompt(
   }
 
   if (agentContexts && agentContexts.length > 0) {
-    const contextInfo = agentContexts
-      .map((ctx) => `[${ctx.type}]`)
-      .join(', ')
+    const contextInfo = agentContexts.map((ctx) => `[${ctx.type}]`).join(', ')
     basePrompt = `${basePrompt}\n\nThe user has provided the following context: ${contextInfo}`
   }
 
@@ -125,8 +119,7 @@ interface BuildMessagesParams {
 }
 
 function buildMessages(params: BuildMessagesParams): Message[] {
-  const { message, conversationHistory, agentContexts, fileAttachments, implicitFeedback } =
-    params
+  const { message, conversationHistory, agentContexts, fileAttachments, implicitFeedback } = params
 
   const messages: Message[] = []
 
@@ -142,9 +135,7 @@ function buildMessages(params: BuildMessagesParams): Message[] {
   }
 
   if (agentContexts && agentContexts.length > 0) {
-    const contextContent = agentContexts
-      .map((ctx) => `[${ctx.type}]\n${ctx.content}`)
-      .join('\n\n')
+    const contextContent = agentContexts.map((ctx) => `[${ctx.type}]\n${ctx.content}`).join('\n\n')
     messages.push({
       role: 'user',
       content: `Context provided:\n${contextContent}`,
@@ -152,12 +143,10 @@ function buildMessages(params: BuildMessagesParams): Message[] {
   }
 
   if (fileAttachments && fileAttachments.length > 0) {
-    const content: Array<{ type: 'text'; text: string } | any> = [
-      { type: 'text', text: message },
-    ]
+    const content: Array<{ type: 'text'; text: string } | any> = [{ type: 'text', text: message }]
 
-    for (const { attachment } of fileAttachments) {
-      const fileContent = createFileContent(Buffer.from(0), attachment.media_type)
+    for (const { buffer, attachment } of fileAttachments) {
+      const fileContent = createFileContent(buffer, attachment.media_type)
       if (fileContent) {
         content.push(fileContent)
       }

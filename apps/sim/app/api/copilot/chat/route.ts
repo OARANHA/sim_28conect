@@ -377,7 +377,7 @@ export async function POST(req: NextRequest) {
       workflowId,
       chatId: actualChatId,
       fileAttachments: processedFileContents.map((fc) => ({
-        buffer: Buffer.alloc(0),
+        buffer: fc.buffer,
         attachment: {
           id: fc.id,
           key: fc.key,
