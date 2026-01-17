@@ -90,6 +90,14 @@ export const mistralProvider: ProviderConfig = {
       messages: allMessages,
     }
 
+    logger.info('Mistral payload:', {
+      model: payload.model,
+      messagesCount: payload.messages.length,
+      hasTools: !!tools,
+      firstMessageRole: payload.messages[0]?.role,
+      firstMessageContentType: typeof payload.messages[0]?.content,
+    })
+
     if (request.temperature !== undefined) payload.temperature = request.temperature
     if (request.maxTokens !== undefined) payload.max_tokens = request.maxTokens
 
@@ -549,7 +557,12 @@ export const mistralProvider: ProviderConfig = {
 
       logger.error('Error in Mistral request:', {
         error,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        errorStack: error instanceof Error ? error.stack : undefined,
         duration: totalDuration,
+        model: request.model,
+        messagesCount: allMessages.length,
+        hasTools: !!tools,
       })
 
       const enhancedError = new Error(error instanceof Error ? error.message : String(error))
