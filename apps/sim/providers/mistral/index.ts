@@ -122,41 +122,48 @@ export const mistralProvider: ProviderConfig = {
       }
     }
 
-    const preparedTools: ReturnType<typeof prepareToolsWithUsageControl> | null = null
+    let preparedToolsResult: ReturnType<typeof prepareToolsWithUsageControl> | null = null
 
-    // Enable ALL tools to test the real scenario
-    const testWithOneTool = false
+    if (tools?.length) {
+      logger.info('Processing tools:', { count: tools.length })
 
-    if (!testWithOneTool && tools?.length) {
-      logger.info('Using ALL tools:', {
-        count: tools.length,
-        names: tools.map((t: any) => t.function?.name),
-      })
-
-      const toolsPrep = prepareToolsWithUsageControl(tools, request.tools, logger, 'mistral')
-      const { tools: filteredTools, toolChoice } = toolsPrep
+      preparedToolsResult = prepareToolsWithUsageControl(tools, request.tools, logger, 'mistral')
+      const { tools: filteredTools, toolChoice, forcedTools: forcedToolsList } = preparedToolsResult
 
       logger.info('After prepareToolsWithUsageControl:', {
         filteredCount: filteredTools?.length || 0,
-        toolChoice: JSON.stringify(toolChoice),
+        forcedToolsCount: forcedToolsList?.length || 0,
       })
 
-      if (filteredTools?.length && toolChoice) {
+      if (filteredTools?.length) {
         payload.tools = filteredTools
-        payload.tool_choice = toolChoice
 
-        logger.info('Final payload with tools:', {
+        // Convert toolChoice to Mistral-compatible format
+        if (toolChoice) {
+          if (typeof toolChoice === 'string') {
+            payload.tool_choice = toolChoice
+          } else if (toolChoice.type === 'function' && toolChoice.function?.name) {
+            payload.tool_choice = {
+              type: 'function',
+              function: { name: toolChoice.function.name },
+            }
+          } else if (toolChoice.type === 'any') {
+            payload.tool_choice = 'any'
+          } else if (toolChoice.type === 'tool' && toolChoice.name) {
+            payload.tool_choice = {
+              type: 'function',
+              function: { name: toolChoice.name },
+            }
+          }
+        } else {
+          payload.tool_choice = 'auto'
+        }
+
+        logger.info('Final payload:', {
           toolCount: filteredTools.length,
-          firstTool: filteredTools[0]?.function?.name,
-          toolChoice: JSON.stringify(toolChoice),
+          toolChoice: JSON.stringify(payload.tool_choice),
         })
       }
-    } else if (tools?.length) {
-      logger.info('Single tool mode:', {
-        name: tools[0]?.function?.name,
-      })
-      payload.tools = [tools[0]]
-      payload.tool_choice = 'auto'
     }
 
     logger.info('=== ABOUT TO CALL MISTRAL API ===')
@@ -255,9 +262,11 @@ export const mistralProvider: ProviderConfig = {
 
       const originalToolChoice = payload.tool_choice
 
-      // For testing with single tool, use empty forcedTools
-      const forcedTools: string[] = []
+      // Use forcedTools from preparedToolsResult
+      const forcedTools = preparedToolsResult?.forcedTools || []
       let usedForcedTools: string[] = []
+
+      logger.info('Using forcedTools:', { count: forcedTools.length, tools: forcedTools })
 
       const checkForForcedToolUsage = (
         response: any,
@@ -370,7 +379,7 @@ export const mistralProvider: ProviderConfig = {
         const executionResults = await Promise.allSettled(toolExecutionPromises)
         currentMessages.push({
           role: 'assistant',
-          content: null,
+          content: '', // Use empty string instead of null for Mistral API
           tool_calls: toolCallsInResponse.map((tc) => ({
             id: tc.id,
             type: 'function',
