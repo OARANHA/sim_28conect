@@ -14,7 +14,7 @@ import type {
 import {
   calculateCost,
   prepareToolExecution,
-  prepareToolsWithUsageControl,
+  type prepareToolsWithUsageControl,
   trackForcedToolUsage,
 } from '@/providers/utils'
 import { executeTool } from '@/tools'
@@ -122,38 +122,29 @@ export const mistralProvider: ProviderConfig = {
       }
     }
 
-    let preparedTools: ReturnType<typeof prepareToolsWithUsageControl> | null = null
+    const preparedTools: ReturnType<typeof prepareToolsWithUsageControl> | null = null
 
-    // Test each tool individually to find the problematic one
-    const useTools = false
+    // Enable tools gradually - start with just 1 tool
+    const testWithOneTool = true
 
-    if (useTools && tools?.length) {
-      // Log all tools for debugging
-      logger.info('Testing tools individually...')
+    if (testWithOneTool && tools?.length) {
+      // Use only the first tool to test
+      const firstTool = tools[0]
 
-      for (let i = 0; i < tools.length; i++) {
-        const tool = tools[i]
-        logger.info(`Testing tool ${i + 1}/${tools.length}:`, {
-          name: tool.function?.name,
-          parameters: JSON.stringify(tool.function?.parameters),
-        })
-      }
+      logger.info('Testing with single tool:', {
+        name: firstTool.function?.name,
+        parameters: JSON.stringify(firstTool.function?.parameters),
+      })
 
-      preparedTools = prepareToolsWithUsageControl(tools, request.tools, logger, 'mistral')
-      const { tools: filteredTools, toolChoice } = preparedTools
+      payload.tools = [firstTool]
+      payload.tool_choice = 'auto'
 
-      if (filteredTools?.length && toolChoice) {
-        payload.tools = filteredTools
-        payload.tool_choice = toolChoice
-
-        logger.info('Using tools in request:', {
-          count: filteredTools.length,
-          names: filteredTools.map((t: any) => t.function.name),
-          toolChoice: JSON.stringify(toolChoice),
-        })
-      }
+      logger.info('Payload with single tool:', {
+        toolName: firstTool.function?.name,
+        hasToolChoice: true,
+      })
     } else if (tools?.length) {
-      logger.info(`Tools available but disabled: ${tools.length} tools`, {
+      logger.info(`All tools available: ${tools.length}`, {
         names: tools.map((t: any) => t.function.name),
       })
     }
@@ -253,7 +244,8 @@ export const mistralProvider: ProviderConfig = {
 
       const originalToolChoice = payload.tool_choice
 
-      const forcedTools = preparedTools?.forcedTools || []
+      // For testing with single tool, use empty forcedTools
+      const forcedTools: string[] = []
       let usedForcedTools: string[] = []
 
       const checkForForcedToolUsage = (
