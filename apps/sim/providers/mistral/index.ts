@@ -57,6 +57,10 @@ export const mistralProvider: ProviderConfig = {
     const allMessages = []
 
     if (request.systemPrompt) {
+      logger.info('System prompt being sent:', {
+        length: request.systemPrompt.length,
+        preview: request.systemPrompt.substring(0, 200),
+      })
       allMessages.push({
         role: 'system',
         content: request.systemPrompt,
@@ -85,20 +89,25 @@ export const mistralProvider: ProviderConfig = {
         }))
       : undefined
 
+    logger.info('Tools being sent:', {
+      hasTools: !!tools,
+      toolCount: tools?.length || 0,
+      toolNames: tools?.map((t: any) => t.function.name),
+    })
+
     const payload: any = {
       model: request.model,
       messages: allMessages,
     }
 
-    logger.info('Mistral request:', {
+    logger.info('Mistral request details:', {
       model: payload.model,
       messagesCount: payload.messages.length,
-      hasTools: !!tools,
-      firstMessageRole: payload.messages[0]?.role,
-      firstMessageContent:
-        typeof payload.messages[0]?.content === 'string'
-          ? payload.messages[0]?.content?.substring(0, 100)
-          : '[array content]',
+      messages: payload.messages.map((m: any) => ({
+        role: m.role,
+        contentType: typeof m.content,
+        contentLength: typeof m.content === 'string' ? m.content.length : '[complex]',
+      })),
     })
 
     if (request.temperature !== undefined) payload.temperature = request.temperature
