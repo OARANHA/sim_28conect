@@ -90,12 +90,15 @@ export const mistralProvider: ProviderConfig = {
       messages: allMessages,
     }
 
-    logger.info('Mistral payload:', {
+    logger.info('Mistral request:', {
       model: payload.model,
       messagesCount: payload.messages.length,
       hasTools: !!tools,
       firstMessageRole: payload.messages[0]?.role,
-      firstMessageContentType: typeof payload.messages[0]?.content,
+      firstMessageContent:
+        typeof payload.messages[0]?.content === 'string'
+          ? payload.messages[0]?.content?.substring(0, 100)
+          : '[array content]',
     })
 
     if (request.temperature !== undefined) payload.temperature = request.temperature
