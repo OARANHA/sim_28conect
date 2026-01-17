@@ -14,7 +14,7 @@ import type {
 import {
   calculateCost,
   prepareToolExecution,
-  type prepareToolsWithUsageControl,
+  prepareToolsWithUsageControl,
   trackForcedToolUsage,
 } from '@/providers/utils'
 import { executeTool } from '@/tools'
@@ -124,32 +124,43 @@ export const mistralProvider: ProviderConfig = {
 
     const preparedTools: ReturnType<typeof prepareToolsWithUsageControl> | null = null
 
-    // Enable tools gradually - start with just 1 tool
-    const testWithOneTool = true
+    // Enable ALL tools to test the real scenario
+    const testWithOneTool = false
 
-    if (testWithOneTool && tools?.length) {
-      // Use only the first tool to test
-      const firstTool = tools[0]
-
-      logger.info('Testing with single tool:', {
-        name: firstTool.function?.name,
-        parameters: JSON.stringify(firstTool.function?.parameters),
+    if (!testWithOneTool && tools?.length) {
+      logger.info('Using ALL tools:', {
+        count: tools.length,
+        names: tools.map((t: any) => t.function?.name),
       })
 
-      payload.tools = [firstTool]
-      payload.tool_choice = 'auto'
+      const toolsPrep = prepareToolsWithUsageControl(tools, request.tools, logger, 'mistral')
+      const { tools: filteredTools, toolChoice } = toolsPrep
 
-      logger.info('Payload with single tool:', {
-        toolName: firstTool.function?.name,
-        hasToolChoice: true,
+      logger.info('After prepareToolsWithUsageControl:', {
+        filteredCount: filteredTools?.length || 0,
+        toolChoice: JSON.stringify(toolChoice),
       })
+
+      if (filteredTools?.length && toolChoice) {
+        payload.tools = filteredTools
+        payload.tool_choice = toolChoice
+
+        logger.info('Final payload with tools:', {
+          toolCount: filteredTools.length,
+          firstTool: filteredTools[0]?.function?.name,
+          toolChoice: JSON.stringify(toolChoice),
+        })
+      }
     } else if (tools?.length) {
-      logger.info(`All tools available: ${tools.length}`, {
-        names: tools.map((t: any) => t.function.name),
+      logger.info('Single tool mode:', {
+        name: tools[0]?.function?.name,
       })
+      payload.tools = [tools[0]]
+      payload.tool_choice = 'auto'
     }
 
-    logger.info('Final payload:', {
+    logger.info('=== ABOUT TO CALL MISTRAL API ===')
+    logger.info('Payload:', {
       model: payload.model,
       hasTools: !!payload.tools,
       toolCount: payload.tools?.length || 0,
