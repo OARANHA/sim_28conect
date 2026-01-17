@@ -46,8 +46,11 @@ export const mistralProvider: ProviderConfig = {
     })
 
     if (!request.apiKey) {
+      logger.error('API key missing for Mistral request')
       throw new Error('API key is required for Mistral AI')
     }
+
+    logger.info('Creating Mistral client and preparing request')
 
     const mistral = new OpenAI({
       apiKey: request.apiKey,
