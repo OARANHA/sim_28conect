@@ -363,6 +363,14 @@ export async function POST(req: NextRequest) {
     }
 
     const providerId = getProviderFromModel(modelToUse)
+    logger.info(`[${tracker.requestId}] Copilot request prepared`, {
+      providerId,
+      model: modelToUse,
+      stream,
+      hasTools: integrationTools.length > 0,
+      hasContexts: agentContexts.length > 0,
+    })
+
     const providerRequest = convertCopilotToProviderRequest({
       message,
       model: modelToUse,
@@ -391,6 +399,10 @@ export async function POST(req: NextRequest) {
 
     if (providerId === 'mistral') {
       providerRequest.apiKey = env.MISTRAL_API_KEY || env.COPILOT_API_KEY
+      logger.info(`[${tracker.requestId}] Using MISTRAL_API_KEY`, {
+        hasKey: !!providerRequest.apiKey,
+        keyLength: providerRequest.apiKey?.length || 0,
+      })
     } else {
       providerRequest.apiKey = env.COPILOT_API_KEY
     }
@@ -399,6 +411,7 @@ export async function POST(req: NextRequest) {
       providerId,
       model: modelToUse,
       hasTools: integrationTools.length > 0,
+      hasApiKey: !!providerRequest.apiKey,
     })
 
     const result = await executeProviderRequest(providerId, providerRequest)
