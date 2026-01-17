@@ -11,7 +11,6 @@ import {
   convertStreamingToSSE,
 } from '@/lib/copilot/adapters'
 import { getCopilotModel } from '@/lib/copilot/config'
-import { getProviderConfig } from '@/lib/copilot/providers'
 import {
   authenticateCopilotRequestSessionOnly,
   createBadRequestResponse,
@@ -19,8 +18,6 @@ import {
   createRequestTracker,
   createUnauthorizedResponse,
 } from '@/lib/copilot/request-helpers'
-import { getCredentialsServerTool } from '@/lib/copilot/tools/server/user/get-credentials'
-import { env } from '@/lib/core/config/env'
 import { CopilotFiles } from '@/lib/uploads'
 import { createFileContent } from '@/lib/uploads/utils/file-utils'
 import { executeProviderRequest } from '@/providers'
@@ -240,143 +237,13 @@ export async function POST(req: NextRequest) {
         messages.push({
           role: msg.role,
           content: msg.content,
-        })
-      }
-    }
-
-    // Add implicit feedback if provided
-    if (implicitFeedback) {
-      messages.push({
-        role: 'system',
-        content: implicitFeedback,
       })
     }
 
-    // Add current user message with file attachments
-    if (processedFileContents.length > 0) {
-      // Message with files - use content array format
-      const content: any[] = [{ type: 'text', text: message }]
-
-      // Add file contents
-      for (const fileContent of processedFileContents) {
-        content.push(fileContent)
-      }
-
-      messages.push({
-        role: 'user',
-        content,
-      })
-    } else {
-      // Text-only message
-      messages.push({
-        role: 'user',
-        content: message,
-      })
-    }
-
-    const defaults = getCopilotModel('chat')
-    const modelToUse = env.COPILOT_MODEL || defaults.model
-
-    // Get provider configuration - use provider from request body (comes from UI selector)
-    const providerConfig = getProviderConfig(provider)
-
-    if (!providerConfig) {
-      logger.warn(`[${tracker.requestId}] No provider configuration found, using server defaults`)
-    } else {
-      logger.info(`[${tracker.requestId}] Using provider configuration`, {
-        provider: providerConfig.provider,
-        model: modelToUse,
-        isOverride: !!provider,
-        selectedFromUI: !!provider,
-      })
-    }
-
-    // Determine conversationId to use for this request
-    const effectiveConversationId =
-      (currentChat?.conversationId as string | undefined) || conversationId
-
-    // For agent/build mode, fetch credentials and build tool definitions
-    let integrationTools: any[] = []
-    let baseTools: any[] = []
-    let credentials: {
-      oauth: Record<
-        string,
-        { accessToken: string; accountId: string; name: string; expiresAt?: string }
-      >
-      apiKeys: string[]
-      metadata?: {
-        connectedOAuth: Array<{ provider: string; name: string; scopes?: string[] }>
-        configuredApiKeys: string[]
-      }
-    } | null = null
-
-    if (mode === 'agent') {
-      // Build base tools (executed locally, not deferred)
-      // Include function_execute for code execution capability
-      baseTools = [
-        {
-          name: 'function_execute',
-          description:
-            'Execute JavaScript code to perform calculations, data transformations, API calls, or any programmatic task. Code runs in a secure sandbox with fetch() available. Write plain statements (not wrapped in functions). Example: const res = await fetch(url); const data = await res.json(); return data;',
-          input_schema: {
-            type: 'object',
-            properties: {
-              code: {
-                type: 'string',
-                description:
-                  'Raw JavaScript statements to execute. Code is auto-wrapped in async context. Use fetch() for HTTP requests. Write like: const res = await fetch(url); return await res.json();',
-              },
-            },
-            required: ['code'],
-          },
-          executeLocally: true,
-        },
-      ]
-      // Fetch user credentials (OAuth + API keys) - pass workflowId to get workspace env vars
-      try {
-        const rawCredentials = await getCredentialsServerTool.execute(
-          { workflowId },
-          { userId: authenticatedUserId }
-        )
-
-        // Transform OAuth credentials to map format: { [provider]: { accessToken, accountId, ... } }
-        const oauthMap: Record<
-          string,
-          { accessToken: string; accountId: string; name: string; expiresAt?: string }
-        > = {}
-        const connectedOAuth: Array<{ provider: string; name: string; scopes?: string[] }> = []
-        for (const cred of rawCredentials?.oauth?.connected?.credentials || []) {
-          if (cred.accessToken) {
-            oauthMap[cred.provider] = {
-              accessToken: cred.accessToken,
-              accountId: cred.id,
-              name: cred.name,
-            }
-            connectedOAuth.push({
-              provider: cred.provider,
-              name: cred.name,
-            })
-          }
-        }
-
-        credentials = {
-          oauth: oauthMap,
-          apiKeys: rawCredentials?.environment?.variableNames || [],
-          metadata: {
-            connectedOAuth,
-            configuredApiKeys: rawCredentials?.environment?.variableNames || [],
-          },
-        }
-
-        logger.info(`[${tracker.requestId}] Fetched credentials for build mode`, {
-          oauthProviders: Object.keys(oauthMap),
-          apiKeyCount: credentials.apiKeys.length,
-        })
-      } catch (error) {
+  } catch (error) 
         logger.warn(`[${tracker.requestId}] Failed to fetch credentials`, {
           error: error instanceof Error ? error.message : String(error),
         })
-      }
 
       // Build tool definitions (schemas only)
       try {
