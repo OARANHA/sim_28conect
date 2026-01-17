@@ -129,7 +129,10 @@ export const mistralProvider: ProviderConfig = {
 
     let preparedTools: ReturnType<typeof prepareToolsWithUsageControl> | null = null
 
-    if (tools?.length) {
+    // Temporarily disable tools to test if they are causing the 400 error
+    const toolsEnabled = false
+
+    if (toolsEnabled && tools?.length) {
       preparedTools = prepareToolsWithUsageControl(tools, request.tools, logger, 'mistral')
       const { tools: filteredTools, toolChoice } = preparedTools
 
@@ -139,19 +142,14 @@ export const mistralProvider: ProviderConfig = {
 
         logger.info('Mistral request configuration:', {
           toolCount: filteredTools.length,
-          toolChoice:
-            typeof toolChoice === 'string'
-              ? toolChoice
-              : toolChoice.type === 'function'
-                ? `force:${toolChoice.function.name}`
-                : toolChoice.type === 'tool'
-                  ? `force:${toolChoice.name}`
-                  : toolChoice.type === 'any'
-                    ? `force:${toolChoice.any?.name || 'unknown'}`
-                    : 'unknown',
+          toolChoice: JSON.stringify(toolChoice),
+          firstToolName: filteredTools[0]?.function?.name,
+          firstToolParams: JSON.stringify(filteredTools[0]?.function?.parameters),
           model: request.model,
         })
       }
+    } else if (tools?.length) {
+      logger.info('Tools disabled for this request, skipping tools')
     }
 
     const providerStartTime = Date.now()
