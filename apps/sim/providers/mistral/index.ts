@@ -124,33 +124,38 @@ export const mistralProvider: ProviderConfig = {
 
     let preparedTools: ReturnType<typeof prepareToolsWithUsageControl> | null = null
 
-    // Temporarily disable tools to fix 400 error
+    // Test each tool individually to find the problematic one
     const useTools = false
 
     if (useTools && tools?.length) {
-      logger.info('Input tools:', JSON.stringify(tools.slice(0, 2), null, 2))
+      // Log all tools for debugging
+      logger.info('Testing tools individually...')
+
+      for (let i = 0; i < tools.length; i++) {
+        const tool = tools[i]
+        logger.info(`Testing tool ${i + 1}/${tools.length}:`, {
+          name: tool.function?.name,
+          parameters: JSON.stringify(tool.function?.parameters),
+        })
+      }
 
       preparedTools = prepareToolsWithUsageControl(tools, request.tools, logger, 'mistral')
       const { tools: filteredTools, toolChoice } = preparedTools
-
-      logger.info('Tools prepared:', {
-        inputToolCount: tools.length,
-        filteredToolCount: filteredTools?.length || 0,
-        toolChoice: JSON.stringify(toolChoice),
-        firstToolName: filteredTools?.[0]?.function?.name,
-      })
 
       if (filteredTools?.length && toolChoice) {
         payload.tools = filteredTools
         payload.tool_choice = toolChoice
 
-        logger.info('Mistral request with tools:', {
-          toolCount: filteredTools.length,
+        logger.info('Using tools in request:', {
+          count: filteredTools.length,
+          names: filteredTools.map((t: any) => t.function.name),
           toolChoice: JSON.stringify(toolChoice),
         })
       }
     } else if (tools?.length) {
-      logger.info('Tools disabled for debugging, skipping tools')
+      logger.info(`Tools available but disabled: ${tools.length} tools`, {
+        names: tools.map((t: any) => t.function.name),
+      })
     }
 
     logger.info('Final payload:', {
