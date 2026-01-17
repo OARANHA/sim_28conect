@@ -106,11 +106,6 @@ export const mistralProvider: ProviderConfig = {
     logger.info('Mistral request details:', {
       model: payload.model,
       messagesCount: payload.messages.length,
-      messages: payload.messages.map((m: any) => ({
-        role: m.role,
-        contentType: typeof m.content,
-        contentLength: typeof m.content === 'string' ? m.content.length : '[complex]',
-      })),
     })
 
     if (request.temperature !== undefined) payload.temperature = request.temperature
@@ -129,7 +124,10 @@ export const mistralProvider: ProviderConfig = {
 
     let preparedTools: ReturnType<typeof prepareToolsWithUsageControl> | null = null
 
-    if (tools?.length) {
+    // Temporarily disable tools to fix 400 error
+    const useTools = false
+
+    if (useTools && tools?.length) {
       logger.info('Input tools:', JSON.stringify(tools.slice(0, 2), null, 2))
 
       preparedTools = prepareToolsWithUsageControl(tools, request.tools, logger, 'mistral')
@@ -151,16 +149,14 @@ export const mistralProvider: ProviderConfig = {
           toolChoice: JSON.stringify(toolChoice),
         })
       }
-    } else {
-      logger.info('No tools provided for this request')
+    } else if (tools?.length) {
+      logger.info('Tools disabled for debugging, skipping tools')
     }
 
-    logger.info('Final payload (without messages):', {
+    logger.info('Final payload:', {
       model: payload.model,
       hasTools: !!payload.tools,
       toolCount: payload.tools?.length || 0,
-      hasToolChoice: !!payload.tool_choice,
-      toolChoiceValue: JSON.stringify(payload.tool_choice),
     })
 
     const providerStartTime = Date.now()
