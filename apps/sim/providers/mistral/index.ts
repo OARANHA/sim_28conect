@@ -167,25 +167,16 @@ export const mistralProvider: ProviderConfig = {
     }
 
     logger.info('=== ABOUT TO CALL MISTRAL API ===')
-    logger.info(
-      'FULL PAYLOAD:',
-      JSON.stringify(
-        {
-          model: payload.model,
-          messages: payload.messages.map((m: any) => ({
-            role: m.role,
-            contentType: typeof m.content,
-          })),
-          tools: payload.tools?.map((t: any) => ({
-            name: t.function?.name,
-            parameters: t.function?.parameters,
-          })),
-          tool_choice: payload.tool_choice,
-        },
-        null,
-        2
-      )
-    )
+    const debugPayload = {
+      model: payload.model,
+      messages: payload.messages.map((m: any) => ({ role: m.role, contentType: typeof m.content })),
+      tools: payload.tools?.map((t: any) => ({
+        name: t.function?.name,
+        parameters: t.function?.parameters,
+      })),
+      tool_choice: payload.tool_choice,
+    }
+    console.error('MISTRAL DEBUG PAYLOAD:', JSON.stringify(debugPayload, null, 2))
 
     const providerStartTime = Date.now()
     const providerStartTimeISO = new Date(providerStartTime).toISOString()
